@@ -32,6 +32,13 @@ if [ -f "$PATCH" ] && ! grep -q synthesize_edge tts.py; then
   git apply "$PATCH" && echo "Voz gratuita (Edge TTS) y respaldo local aplicados."
 fi
 
+# Command-centre UI: chat panel with typing, live vitals HUD, terminals bar.
+UI_PATCH="$HERE/jarvis-ui-command-center.patch"
+if [ -f "$UI_PATCH" ] && [ ! -f frontend/src/chat.ts ]; then
+  git checkout -- frontend/src 2>/dev/null || true
+  git apply "$UI_PATCH" && echo "Interfaz 'centro de mando' aplicada."
+fi
+
 [ -f .env ] || cp .env.example .env
 "$PY" -m venv .venv 2>/dev/null || true
 # shellcheck disable=SC1091

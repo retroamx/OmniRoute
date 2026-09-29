@@ -1,0 +1,944 @@
+diff --git a/frontend/src/chat.css b/frontend/src/chat.css
+new file mode 100644
+index 0000000..a183487
+--- /dev/null
++++ b/frontend/src/chat.css
+@@ -0,0 +1,245 @@
++/* Chat panel — glass surface over the orb, in the existing cyan-on-black palette. */
++
++:root {
++  --chat-w: 440px;
++  --chat-accent: #38bdf8;
++  --chat-accent-soft: rgba(56, 189, 248, 0.14);
++  --chat-line: rgba(56, 189, 248, 0.16);
++  --chat-text: #e6f3ff;
++  --chat-dim: rgba(190, 220, 245, 0.55);
++}
++
++#btn-chat.active {
++  background: rgba(56, 189, 248, 0.16);
++  color: rgba(56, 189, 248, 0.95);
++  border-color: rgba(56, 189, 248, 0.4);
++}
++
++/* Slide the panel in and push the controls clear of it. */
++.chat {
++  position: fixed;
++  top: 0;
++  right: 0;
++  bottom: 0;
++  width: min(var(--chat-w), 100vw);
++  display: flex;
++  flex-direction: column;
++  background: linear-gradient(180deg, rgba(8, 13, 22, 0.86), rgba(5, 8, 14, 0.92));
++  -webkit-backdrop-filter: blur(22px) saturate(140%);
++  backdrop-filter: blur(22px) saturate(140%);
++  border-left: 1px solid var(--chat-line);
++  box-shadow: -24px 0 60px rgba(0, 0, 0, 0.55);
++  transform: translateX(102%);
++  transition: transform 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++  z-index: 30;
++  color: var(--chat-text);
++}
++body.chat-open .chat { transform: translateX(0); }
++body.chat-open #controls { right: calc(min(var(--chat-w), 100vw) + 16px); }
++body.chat-open #menu-dropdown { right: calc(min(var(--chat-w), 100vw) + 16px); }
++#controls, #menu-dropdown { transition: right 0.32s cubic-bezier(0.22, 0.8, 0.24, 1); }
++@media (max-width: 720px) {
++  body.chat-open #controls, body.chat-open #menu-dropdown { right: 16px; display: none; }
++}
++
++/* ── header ─────────────────────────────────────────────────────────────── */
++.chat-head {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  padding: 16px 18px;
++  border-bottom: 1px solid var(--chat-line);
++}
++.chat-avatar {
++  width: 36px;
++  height: 36px;
++  border-radius: 50%;
++  display: grid;
++  place-items: center;
++  font-weight: 600;
++  letter-spacing: 0.5px;
++  color: #04121c;
++  background: radial-gradient(circle at 30% 25%, #9be4ff, #1592cf 70%);
++  box-shadow: 0 0 18px rgba(56, 189, 248, 0.45);
++}
++.chat-titles { flex: 1; min-width: 0; }
++.chat-title { font-size: 15px; font-weight: 600; letter-spacing: 2.5px; }
++.chat-sub { font-size: 11.5px; color: var(--chat-dim); margin-top: 2px; }
++
++.chat-pill {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  font-size: 11px;
++  letter-spacing: 0.4px;
++  color: var(--chat-dim);
++  padding: 5px 10px;
++  border: 1px solid var(--chat-line);
++  border-radius: 999px;
++  background: rgba(56, 189, 248, 0.06);
++  white-space: nowrap;
++}
++.chat-pill-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
++.chat-pill[data-state="listening"] .chat-pill-dot { background: #34d399; box-shadow: 0 0 8px #34d399; }
++.chat-pill[data-state="thinking"] .chat-pill-dot,
++.chat-pill[data-state="compacting"] .chat-pill-dot { background: #fbbf24; animation: chat-pulse 1s infinite; }
++.chat-pill[data-state="speaking"] .chat-pill-dot { background: var(--chat-accent); box-shadow: 0 0 8px var(--chat-accent); animation: chat-pulse 0.8s infinite; }
++
++.chat-icon-btn {
++  border: 1px solid var(--chat-line);
++  background: rgba(56, 189, 248, 0.05);
++  color: var(--chat-dim);
++  border-radius: 8px;
++  min-width: 32px;
++  height: 32px;
++  padding: 0 10px;
++  font: inherit;
++  font-size: 12px;
++  cursor: pointer;
++  transition: all 0.15s;
++}
++.chat-icon-btn:hover { color: var(--chat-text); border-color: rgba(56, 189, 248, 0.45); background: var(--chat-accent-soft); }
++.chat-stop[hidden] { display: none; }
++
++/* ── messages ───────────────────────────────────────────────────────────── */
++.chat-list {
++  flex: 1;
++  overflow-y: auto;
++  padding: 20px 18px 8px;
++  display: flex;
++  flex-direction: column;
++  gap: 14px;
++  scroll-behavior: smooth;
++}
++.chat-list::-webkit-scrollbar { width: 8px; }
++.chat-list::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.18); border-radius: 8px; }
++
++.msg { display: flex; animation: chat-in 0.22s ease-out; }
++.msg-user { justify-content: flex-end; }
++.bubble {
++  max-width: 88%;
++  padding: 11px 14px;
++  border-radius: 16px;
++  font-size: 14px;
++  line-height: 1.55;
++  word-wrap: break-word;
++  overflow-wrap: anywhere;
++}
++.msg-bot .bubble {
++  background: rgba(255, 255, 255, 0.045);
++  border: 1px solid rgba(255, 255, 255, 0.07);
++  border-bottom-left-radius: 5px;
++}
++.msg-user .bubble {
++  background: linear-gradient(135deg, rgba(56, 189, 248, 0.26), rgba(14, 116, 200, 0.22));
++  border: 1px solid rgba(56, 189, 248, 0.35);
++  border-bottom-right-radius: 5px;
++}
++.bubble code {
++  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
++  font-size: 12.5px;
++  background: rgba(0, 0, 0, 0.35);
++  padding: 1px 5px;
++  border-radius: 4px;
++}
++.bubble pre {
++  margin: 8px 0 2px;
++  padding: 10px 12px;
++  background: rgba(0, 0, 0, 0.45);
++  border: 1px solid var(--chat-line);
++  border-radius: 8px;
++  overflow-x: auto;
++}
++.bubble pre code { background: none; padding: 0; }
++.stamp { margin-top: 6px; font-size: 10.5px; color: var(--chat-dim); text-align: right; }
++
++.typing { display: flex; gap: 5px; padding: 14px 16px; }
++.typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--chat-accent); opacity: 0.35; animation: chat-bounce 1.2s infinite; }
++.typing i:nth-child(2) { animation-delay: 0.15s; }
++.typing i:nth-child(3) { animation-delay: 0.3s; }
++
++/* ── empty state ────────────────────────────────────────────────────────── */
++.chat-empty { margin: auto 0; text-align: center; padding: 0 6px 28px; }
++.chat-empty-title { font-size: 20px; font-weight: 600; letter-spacing: 0.3px; }
++.chat-empty-sub { margin: 8px auto 20px; max-width: 320px; font-size: 13px; line-height: 1.55; color: var(--chat-dim); }
++.chat-chips { display: flex; flex-direction: column; gap: 8px; }
++.chat-chip {
++  font: inherit;
++  font-size: 13px;
++  text-align: left;
++  padding: 11px 14px;
++  color: var(--chat-text);
++  background: rgba(56, 189, 248, 0.06);
++  border: 1px solid var(--chat-line);
++  border-radius: 12px;
++  cursor: pointer;
++  transition: all 0.15s;
++}
++.chat-chip:hover { background: var(--chat-accent-soft); border-color: rgba(56, 189, 248, 0.45); transform: translateY(-1px); }
++
++/* ── composer ───────────────────────────────────────────────────────────── */
++.chat-composer {
++  display: flex;
++  align-items: flex-end;
++  gap: 10px;
++  margin: 8px 16px 0;
++  padding: 8px 8px 8px 14px;
++  background: rgba(255, 255, 255, 0.05);
++  border: 1px solid var(--chat-line);
++  border-radius: 16px;
++  transition: border-color 0.15s, box-shadow 0.15s;
++}
++.chat-composer:focus-within { border-color: rgba(56, 189, 248, 0.55); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1); }
++.chat-input {
++  flex: 1;
++  resize: none;
++  border: 0;
++  outline: 0;
++  background: transparent;
++  color: var(--chat-text);
++  font: inherit;
++  font-size: 14px;
++  line-height: 1.5;
++  padding: 7px 0;
++  max-height: 160px;
++}
++.chat-input::placeholder { color: rgba(190, 220, 245, 0.35); }
++.chat-send {
++  width: 38px;
++  height: 38px;
++  flex: none;
++  border: 0;
++  border-radius: 11px;
++  display: grid;
++  place-items: center;
++  cursor: pointer;
++  color: #04121c;
++  background: linear-gradient(135deg, #7dd3fc, #0ea5e9);
++  transition: transform 0.12s, filter 0.15s;
++}
++.chat-send:hover { filter: brightness(1.12); }
++.chat-send:active { transform: scale(0.94); }
++.chat-hint { padding: 8px 18px 14px; font-size: 10.5px; color: rgba(190, 220, 245, 0.32); text-align: center; letter-spacing: 0.2px; }
++
++/* The orb's own labels would sit under the panel; nudge them into the free area. */
++body.chat-open #status-text,
++body.chat-open #jarvis-label { left: calc((100% - min(var(--chat-w), 100vw)) / 2); }
++body.chat-open #hush { display: none; }
++
++@keyframes chat-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
++@keyframes chat-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.35; } 30% { transform: translateY(-5px); opacity: 1; } }
++@keyframes chat-pulse { 50% { opacity: 0.4; } }
++
++/* ── quick-access skills ────────────────────────────────────────────────── */
++.chat-skills { padding: 14px 18px 4px; border-bottom: 1px solid var(--chat-line); }
++.chat-skills-label { font-size: 10px; letter-spacing: 2.4px; color: var(--chat-dim); margin-bottom: 10px; }
++.chat-skills-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding-bottom: 12px; }
++.chat-skill {
++  display: flex; flex-direction: column; gap: 3px; text-align: left; font: inherit; cursor: pointer;
++  padding: 10px 12px; color: var(--chat-text);
++  background: rgba(56, 189, 248, 0.05); border: 1px solid var(--chat-line); border-radius: 10px;
++  transition: all 0.15s;
++}
++.chat-skill:hover { background: var(--chat-accent-soft); border-color: rgba(56, 189, 248, 0.5); transform: translateY(-1px); }
++.chat-skill-title { font-size: 12.5px; font-weight: 600; }
++.chat-skill-hint { font-size: 10.5px; color: var(--chat-dim); }
+diff --git a/frontend/src/chat.ts b/frontend/src/chat.ts
+new file mode 100644
+index 0000000..d42fc90
+--- /dev/null
++++ b/frontend/src/chat.ts
+@@ -0,0 +1,327 @@
++/**
++ * Chat panel — type to JARVIS and read his replies as a conversation.
++ *
++ * It rides the same WebSocket as the microphone: a typed message is sent as a
++ * final transcript, and his answer is rebuilt from the `audio` / `text` frames
++ * (each carries the sentence chunk it voices). Nothing here talks to the
++ * server on its own; main.ts feeds it frames and hands it a send callback.
++ */
++
++import "./chat.css";
++
++export type ChatState = "idle" | "listening" | "thinking" | "speaking" | "compacting";
++
++export interface ChatOptions {
++  onSend(text: string): void;
++  onStop(): void;
++}
++
++export interface Chat {
++  addUser(text: string, viaVoice?: boolean): void;
++  handleMessage(msg: Record<string, unknown>): void;
++  setState(state: ChatState): void;
++  toggle(force?: boolean): void;
++}
++
++const SKILLS: { title: string; hint: string; prompt: string }[] = [
++  { title: "Planear el día", hint: "prioridades y orden", prompt: "Ayúdame a planear mi día: pregúntame lo que necesites y propón un orden de prioridades." },
++  { title: "Mis sesiones", hint: "qué espera respuesta", prompt: "¿Qué sesiones de Claude Code tengo abiertas y cuáles esperan algo de mí?" },
++  { title: "Investigación", hint: "buscar y resumir", prompt: "Quiero investigar un tema a fondo. Pregúntame cuál y prepara un resumen con fuentes." },
++  { title: "Nuevo proyecto", hint: "diseñar y construir", prompt: "Quiero empezar un proyecto nuevo. Ayúdame a diseñarlo paso a paso, con una pregunta cada vez." },
++];
++
++const STATE_LABEL: Record<ChatState, string> = {
++  idle: "en espera",
++  listening: "escuchando",
++  thinking: "pensando",
++  speaking: "hablando",
++  compacting: "reorganizando memoria",
++};
++
++function el<K extends keyof HTMLElementTagNameMap>(
++  tag: K,
++  cls?: string,
++  text?: string
++): HTMLElementTagNameMap[K] {
++  const node = document.createElement(tag);
++  if (cls) node.className = cls;
++  if (text !== undefined) node.textContent = text;
++  return node;
++}
++
++/**
++ * Render a tiny markdown subset (```blocks```, `code`, **bold**, line breaks)
++ * with DOM nodes only — model output never reaches innerHTML.
++ */
++function renderRich(target: HTMLElement, raw: string): void {
++  target.replaceChildren();
++  const parts = raw.split(/```/);
++  parts.forEach((part, i) => {
++    if (i % 2 === 1) {
++      const pre = el("pre");
++      pre.append(el("code", "", part.trim()));
++      target.append(pre);
++      return;
++    }
++    part.split("\n").forEach((line, li) => {
++      if (li > 0) target.append(document.createElement("br"));
++      line.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/).forEach((tok) => {
++        if (!tok) return;
++        if (tok.startsWith("`") && tok.endsWith("`") && tok.length > 2) target.append(el("code", "", tok.slice(1, -1)));
++        else if (tok.startsWith("**") && tok.endsWith("**") && tok.length > 4) target.append(el("strong", "", tok.slice(2, -2)));
++        else target.append(document.createTextNode(tok));
++      });
++    });
++  });
++}
++
++function svgIcon(path: string, width: number): SVGSVGElement {
++  const ns = "http://www.w3.org/2000/svg";
++  const svg = document.createElementNS(ns, "svg");
++  svg.setAttribute("width", "18");
++  svg.setAttribute("height", "18");
++  svg.setAttribute("viewBox", "0 0 24 24");
++  svg.setAttribute("fill", "none");
++  svg.setAttribute("stroke", "currentColor");
++  svg.setAttribute("stroke-width", String(width));
++  const p = document.createElementNS(ns, "path");
++  p.setAttribute("d", path);
++  svg.append(p);
++  return svg;
++}
++
++function clock(): string {
++  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
++}
++
++export function createChat(opts: ChatOptions): Chat {
++  const panel = el("aside", "chat");
++  panel.id = "chat";
++  panel.setAttribute("aria-label", "Conversación con JARVIS");
++
++  // ── header ────────────────────────────────────────────────────────────────
++  const header = el("header", "chat-head");
++  const avatar = el("div", "chat-avatar", "J");
++  const titles = el("div", "chat-titles");
++  titles.append(el("div", "chat-title", "JARVIS"), el("div", "chat-sub", "impulsado por Claude Code"));
++  const pill = el("div", "chat-pill");
++  const pillDot = el("span", "chat-pill-dot");
++  const pillText = el("span", "chat-pill-text", STATE_LABEL.idle);
++  pill.append(pillDot, pillText);
++  const stopBtn = el("button", "chat-icon-btn chat-stop", "Detener");
++  stopBtn.type = "button";
++  stopBtn.hidden = true;
++  stopBtn.title = "Dejar de hablar (Esc)";
++  const closeBtn = el("button", "chat-icon-btn", "✕");
++  closeBtn.type = "button";
++  closeBtn.title = "Cerrar chat (Ctrl+/)";
++  header.append(avatar, titles, pill, stopBtn, closeBtn);
++
++  // ── message list ──────────────────────────────────────────────────────────
++  const list = el("div", "chat-list");
++  list.setAttribute("role", "log");
++  list.setAttribute("aria-live", "polite");
++
++  const empty = el("div", "chat-empty");
++  empty.append(
++    el("div", "chat-empty-title", "¿En qué te ayudo?"),
++    el("div", "chat-empty-sub", "Escríbeme o háblame. Puedo planear, construir y vigilar tus sesiones de Claude Code.")
++  );
++  list.append(empty);
++
++  const skills = el("section", "chat-skills");
++  skills.append(el("div", "chat-skills-label", "ACCESOS RÁPIDOS"));
++  const grid = el("div", "chat-skills-grid");
++  for (const sk of SKILLS) {
++    const card = el("button", "chat-skill");
++    card.type = "button";
++    card.append(el("span", "chat-skill-title", sk.title), el("span", "chat-skill-hint", sk.hint));
++    card.addEventListener("click", () => send(sk.prompt));
++    grid.append(card);
++  }
++  skills.append(grid);
++
++  // ── composer ──────────────────────────────────────────────────────────────
++  const composer = el("form", "chat-composer");
++  const input = el("textarea", "chat-input");
++  input.rows = 1;
++  input.placeholder = "Escribe un mensaje a JARVIS…";
++  input.setAttribute("aria-label", "Mensaje");
++  const sendBtn = el("button", "chat-send");
++  sendBtn.type = "submit";
++  sendBtn.title = "Enviar (Enter)";
++  sendBtn.append(svgIcon("M12 19V5M5 12l7-7 7 7", 2));
++  composer.append(input, sendBtn);
++  const hint = el("div", "chat-hint", "Enter envía · Shift+Enter nueva línea · Esc detiene la voz");
++
++  panel.append(header, skills, list, composer, hint);
++  document.body.appendChild(panel);
++
++  // ── launcher button (joins the existing top-right controls) ───────────────
++  const launcher = el("button");
++  launcher.id = "btn-chat";
++  launcher.type = "button";
++  launcher.title = "Chat (Ctrl+/)";
++  launcher.append(svgIcon("M21 12a8 8 0 0 1-11.5 7.2L4 20l1-4.6A8 8 0 1 1 21 12z", 1.5));
++  document.getElementById("controls")?.prepend(launcher);
++
++  // ── state ─────────────────────────────────────────────────────────────────
++  let open = false;
++  let state: ChatState = "idle";
++  let typingRow: HTMLElement | null = null;
++  let replyBody: HTMLElement | null = null;
++  let replyRaw = "";
++  let replyUtt: number | null = null;
++  const seen = new Set<string>();
++
++  function scrollDown() {
++    list.scrollTop = list.scrollHeight;
++  }
++
++  function dropEmpty() {
++    if (empty.parentElement) empty.remove();
++  }
++
++  function showTyping(on: boolean) {
++    if (on && !typingRow) {
++      typingRow = el("div", "msg msg-bot");
++      const bubble = el("div", "bubble typing");
++      bubble.append(el("i"), el("i"), el("i"));
++      typingRow.append(bubble);
++      dropEmpty();
++      list.append(typingRow);
++      scrollDown();
++    } else if (!on && typingRow) {
++      typingRow.remove();
++      typingRow = null;
++    }
++  }
++
++  function appendBot(text: string, utt: number | null) {
++    const clean = text.trim();
++    if (!clean) return;
++    showTyping(false);
++    dropEmpty();
++    if (!replyBody || (utt !== null && replyUtt !== null && utt !== replyUtt)) {
++      const row = el("div", "msg msg-bot");
++      const bubble = el("div", "bubble");
++      replyBody = el("div", "bubble-body");
++      bubble.append(replyBody, el("div", "stamp", clock()));
++      row.append(bubble);
++      list.append(row);
++      replyRaw = "";
++    }
++    replyUtt = utt;
++    replyRaw += (replyRaw ? " " : "") + clean;
++    renderRich(replyBody, replyRaw);
++    scrollDown();
++  }
++
++  function addUser(text: string, viaVoice = false) {
++    const clean = text.trim();
++    if (!clean) return;
++    dropEmpty();
++    const row = el("div", "msg msg-user");
++    const bubble = el("div", "bubble");
++    const body = el("div", "bubble-body");
++    renderRich(body, clean);
++    bubble.append(body, el("div", "stamp", (viaVoice ? "🎙 " : "") + clock()));
++    row.append(bubble);
++    list.append(row);
++    // The next reply starts a fresh bubble.
++    replyBody = null;
++    replyUtt = null;
++    scrollDown();
++  }
++
++  function send(text: string) {
++    const clean = text.trim();
++    if (!clean) return;
++    addUser(clean);
++    opts.onSend(clean);
++    showTyping(true);
++    input.value = "";
++    autosize();
++    input.focus();
++  }
++
++  function autosize() {
++    input.style.height = "auto";
++    input.style.height = Math.min(input.scrollHeight, 160) + "px";
++  }
++
++  composer.addEventListener("submit", (e) => {
++    e.preventDefault();
++    send(input.value);
++  });
++  input.addEventListener("input", autosize);
++  input.addEventListener("keydown", (e: KeyboardEvent) => {
++    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
++      e.preventDefault();
++      send(input.value);
++    }
++    // Keep Esc for stopping his voice rather than closing anything.
++    e.stopPropagation();
++    if (e.key === "Escape") opts.onStop();
++  });
++
++  stopBtn.addEventListener("click", () => opts.onStop());
++  closeBtn.addEventListener("click", () => toggle(false));
++  launcher.addEventListener("click", (e) => {
++    e.stopPropagation();
++    toggle();
++  });
++  window.addEventListener("keydown", (e: KeyboardEvent) => {
++    if ((e.ctrlKey || e.metaKey) && e.key === "/") {
++      e.preventDefault();
++      toggle();
++    }
++  });
++
++  function toggle(force?: boolean) {
++    open = force ?? !open;
++    document.body.classList.toggle("chat-open", open);
++    launcher.classList.toggle("active", open);
++    try {
++      localStorage.setItem("jarvis.chat.open", open ? "1" : "0");
++    } catch {
++      /* storage can be blocked; the panel still works */
++    }
++    window.dispatchEvent(new CustomEvent("jarvis:layout"));
++    if (open) setTimeout(() => input.focus(), 250);
++  }
++
++  function setState(next: ChatState) {
++    state = next;
++    pillText.textContent = STATE_LABEL[next];
++    pill.dataset.state = next;
++    stopBtn.hidden = next !== "speaking";
++    if (next === "thinking") showTyping(true);
++    else if (next !== "compacting") showTyping(false);
++  }
++
++  function handleMessage(msg: Record<string, unknown>) {
++    const type = msg.type as string;
++    if (type === "audio" && msg.text) {
++      const utt = Number(msg.utt);
++      const key = `${utt}:${msg.idx}`;
++      if (seen.has(key)) return;
++      seen.add(key);
++      appendBot(String(msg.text), Number.isFinite(utt) ? utt : null);
++    } else if (type === "text" && msg.text) {
++      appendBot(String(msg.text), null);
++    }
++  }
++
++  let remembered = false;
++  try {
++    remembered = localStorage.getItem("jarvis.chat.open") === "1";
++  } catch {
++    /* ignore */
++  }
++  // Open by default on wide screens, so the feature is discoverable.
++  toggle(remembered || window.innerWidth >= 1000);
++  void state;
++
++  return { addUser, handleMessage, setState, toggle };
++}
+diff --git a/frontend/src/hud.css b/frontend/src/hud.css
+new file mode 100644
+index 0000000..cbc9125
+--- /dev/null
++++ b/frontend/src/hud.css
+@@ -0,0 +1,76 @@
++/* Command-centre HUD — sits over the orb; hidden on narrow screens. */
++
++.hud-brand { position: fixed; top: 22px; left: 28px; z-index: 12; color: #e6f3ff; pointer-events: none; }
++.hud-title { font-size: 22px; font-weight: 700; letter-spacing: 5px; }
++.hud-title small { font-size: 11px; font-weight: 400; letter-spacing: 2px; color: rgba(56, 189, 248, 0.7); }
++.hud-tag { margin-top: 3px; font-size: 9.5px; letter-spacing: 3px; color: rgba(190, 220, 245, 0.4); }
++.hud-clock { margin-top: 16px; font-size: 26px; font-variant-numeric: tabular-nums; font-weight: 300; letter-spacing: 2px; color: rgba(230, 243, 255, 0.92); }
++.hud-date { font-size: 10px; letter-spacing: 2.5px; color: rgba(190, 220, 245, 0.4); margin-top: 2px; }
++
++.hud-modes {
++  position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 12;
++  display: flex; gap: 4px; padding: 4px;
++  background: rgba(10, 16, 26, 0.7); border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 12px;
++  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
++  transition: left 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++}
++body.chat-open .hud-modes { left: calc((100% - min(440px, 100vw) + 280px) / 2); }
++.hud-mode { border: 0; background: transparent; color: rgba(190, 220, 245, 0.5); font: inherit; font-size: 12.5px; padding: 7px 16px; border-radius: 9px; cursor: pointer; }
++.hud-mode.active { background: rgba(56, 189, 248, 0.16); color: #e6f3ff; }
++.hud-mode:disabled { opacity: 0.4; cursor: not-allowed; }
++
++.hud-left {
++  position: fixed; top: 150px; left: 24px; bottom: 76px; width: 256px; z-index: 12;
++  display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 4px;
++}
++.hud-left::-webkit-scrollbar { width: 0; }
++.hud-h { font-size: 10px; letter-spacing: 2.6px; color: rgba(190, 220, 245, 0.45); margin: 2px 2px 0; }
++.hud-h2 { margin-top: 10px; }
++.hud-cards { display: flex; flex-direction: column; gap: 9px; }
++.hud-card {
++  padding: 12px 14px; border-radius: 12px;
++  background: linear-gradient(160deg, rgba(56, 189, 248, 0.07), rgba(8, 13, 22, 0.55));
++  border: 1px solid rgba(56, 189, 248, 0.14);
++  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
++}
++.hud-card-label { font-size: 9.5px; letter-spacing: 2px; color: rgba(190, 220, 245, 0.5); }
++.hud-card-value { font-size: 30px; font-weight: 300; color: #f0f9ff; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
++.hud-card-sub { font-size: 10.5px; color: rgba(190, 220, 245, 0.45); margin-top: 6px; }
++.hud-bar { height: 4px; border-radius: 4px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
++.hud-bar i { display: block; height: 100%; background: linear-gradient(90deg, #0ea5e9, #7dd3fc); border-radius: 4px; transition: width 0.6s; }
++.hud-bar i.hot { background: linear-gradient(90deg, #f59e0b, #ef4444); }
++
++.hud-runs { display: flex; flex-direction: column; gap: 6px; }
++.hud-run { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: rgba(230, 243, 255, 0.75); padding: 7px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.035); }
++.hud-run-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.hud-empty { font-size: 11px; line-height: 1.5; color: rgba(190, 220, 245, 0.35); padding: 2px; }
++.hud-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
++.hud-dot.running, .hud-dot.queued { background: #38bdf8; box-shadow: 0 0 8px #38bdf8; }
++.hud-dot.succeeded { background: #34d399; }
++.hud-dot.failed, .hud-dot.timed_out { background: #ef4444; }
++
++.hud-bottom {
++  position: fixed; left: 0; bottom: 0; height: 52px; z-index: 12; display: flex; align-items: center; gap: 16px;
++  right: 0; padding: 0 24px; background: linear-gradient(0deg, rgba(5, 8, 14, 0.92), rgba(5, 8, 14, 0.6));
++  border-top: 1px solid rgba(56, 189, 248, 0.12);
++  transition: right 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++}
++body.chat-open .hud-bottom { right: min(440px, 100vw); }
++.hud-term-label { font-size: 10px; letter-spacing: 2.4px; color: rgba(190, 220, 245, 0.55); white-space: nowrap; }
++.hud-term-count { color: rgba(56, 189, 248, 0.8); }
++.hud-term-chips { flex: 1; display: flex; gap: 8px; overflow-x: auto; }
++.hud-term-chips::-webkit-scrollbar { height: 0; }
++.hud-term-chip { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; padding: 5px 11px; border-radius: 999px; white-space: nowrap; color: #dbeafe; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.08); }
++.hud-term-chip.needs { border-color: rgba(239, 68, 68, 0.5); background: rgba(239, 68, 68, 0.1); }
++.hud-talk { border: 1px solid rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.1); color: #e6f3ff; font: inherit; font-size: 12px; letter-spacing: 1px; padding: 7px 18px; border-radius: 9px; cursor: pointer; }
++.hud-talk:hover { background: rgba(56, 189, 248, 0.2); }
++
++/* The orb's own footer labels are replaced by the bar. */
++#jarvis-label, #mic-level { display: none; }
++#status-text { bottom: 70px; }
++
++@media (max-width: 1199px) {
++  .hud-left, .hud-modes, .hud-brand { display: none; }
++}
++
++#error-text { top: 76px; z-index: 13; }
+diff --git a/frontend/src/hud.ts b/frontend/src/hud.ts
+new file mode 100644
+index 0000000..f19fb12
+--- /dev/null
++++ b/frontend/src/hud.ts
+@@ -0,0 +1,171 @@
++/**
++ * Command-centre HUD around the orb: brand + clock, mode switch, live vitals
++ * (subscription windows, today's runs, recent runs) and a terminals bar that
++ * lists every Claude Code session on the machine. All numbers come from the
++ * JARVIS REST API — nothing here is sample data.
++ */
++
++import "./hud.css";
++
++interface LimitWindow {
++  key: string;
++  label: string;
++  utilization: number | null;
++  resets_at: number | null;
++}
++interface SessionRow {
++  session_id: string;
++  project?: string;
++  state?: string;
++  needs_a_human_hand?: boolean;
++}
++interface RunRow {
++  run_id?: string;
++  id?: string;
++  status?: string;
++  prompt?: string;
++  project?: string;
++}
++
++function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
++  const n = document.createElement(tag);
++  if (cls) n.className = cls;
++  if (text !== undefined) n.textContent = text;
++  return n;
++}
++
++async function getJson<T>(url: string): Promise<T | null> {
++  try {
++    const r = await fetch(url);
++    return r.ok ? ((await r.json()) as T) : null;
++  } catch {
++    return null;
++  }
++}
++
++function fmtReset(epoch: number | null): string {
++  if (!epoch) return "";
++  const mins = Math.max(0, Math.round((epoch * 1000 - Date.now()) / 60000));
++  if (mins < 90) return `reinicia en ${mins} min`;
++  const h = Math.round(mins / 60);
++  return h < 48 ? `reinicia en ${h} h` : `reinicia en ${Math.round(h / 24)} d`;
++}
++
++function fmtTokens(n: number): string {
++  return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
++}
++
++export function createHud(opts: { onTalk(): void }) {
++  // ── top-left: brand + clock ──────────────────────────────────────────────
++  const brand = el("div", "hud-brand");
++  const title = el("div", "hud-title");
++  title.append("JARVIS", el("small", "", " / V2"));
++  const tag = el("div", "hud-tag", "TU CENTRO DE MANDO");
++  const clock = el("div", "hud-clock");
++  const date = el("div", "hud-date");
++  brand.append(title, tag, clock, date);
++
++  // ── top-centre: mode switch ──────────────────────────────────────────────
++  const modes = el("div", "hud-modes");
++  const mClaude = el("button", "hud-mode active", "Claude Code");
++  const mCodex = el("button", "hud-mode", "Codex");
++  mClaude.type = mCodex.type = "button";
++  mCodex.disabled = true;
++  mCodex.title = "No disponible en esta versión de JARVIS";
++  modes.append(mClaude, mCodex);
++
++  // ── left: vitals ─────────────────────────────────────────────────────────
++  const left = el("aside", "hud-left");
++  left.append(el("div", "hud-h", "SIGNOS VITALES"));
++  const cards = el("div", "hud-cards");
++  left.append(cards);
++  left.append(el("div", "hud-h hud-h2", "ÚLTIMAS EJECUCIONES"));
++  const runsList = el("div", "hud-runs");
++  left.append(runsList);
++
++  function card(label: string, value: string, sub: string, pct: number | null): HTMLElement {
++    const c = el("div", "hud-card");
++    c.append(el("div", "hud-card-label", label), el("div", "hud-card-value", value));
++    if (pct !== null) {
++      const bar = el("div", "hud-bar");
++      const fill = el("i");
++      fill.style.width = Math.min(100, Math.max(0, pct)) + "%";
++      if (pct >= 85) fill.classList.add("hot");
++      bar.append(fill);
++      c.append(bar);
++    }
++    c.append(el("div", "hud-card-sub", sub));
++    return c;
++  }
++
++  // ── bottom: terminals bar ────────────────────────────────────────────────
++  const bar = el("div", "hud-bottom");
++  const termLabel = el("div", "hud-term-label", "TERMINALES");
++  const termCount = el("span", "hud-term-count", "0 abiertas");
++  termLabel.append(termCount);
++  const chipsWrap = el("div", "hud-term-chips");
++  const talk = el("button", "hud-talk", "Hablar");
++  talk.type = "button";
++  talk.addEventListener("click", opts.onTalk);
++  bar.append(termLabel, chipsWrap, talk);
++
++  document.body.append(brand, modes, left, bar);
++
++  // ── refresh ──────────────────────────────────────────────────────────────
++  function tickClock() {
++    const d = new Date();
++    clock.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
++    date.textContent = d.toLocaleDateString([], { weekday: "short", day: "2-digit", month: "short" }).toUpperCase();
++  }
++  tickClock();
++  setInterval(tickClock, 1000);
++
++  async function refresh() {
++    const [limits, stats, sessions, runs] = await Promise.all([
++      getJson<{ measured?: boolean; windows?: LimitWindow[] }>("/api/usage/limits"),
++      getJson<{ total_runs: number; total_input_tokens: number; total_output_tokens: number; by_status: Record<string, number> }>("/api/runs/stats"),
++      getJson<{ sessions: SessionRow[] }>("/api/sessions"),
++      getJson<{ runs: RunRow[] }>("/api/runs?limit=4"),
++    ]);
++
++    cards.replaceChildren();
++    const w = (k: string) => limits?.windows?.find((x) => x.key === k);
++    const five = w("five_hour");
++    const seven = w("seven_day");
++    if (five?.utilization != null) cards.append(card("SESIÓN · 5 H", Math.round(five.utilization) + "%", fmtReset(five.resets_at), five.utilization));
++    if (seven?.utilization != null) cards.append(card("SEMANA · 7 D", Math.round(seven.utilization) + "%", fmtReset(seven.resets_at), seven.utilization));
++    if (!five && !seven) cards.append(card("SUSCRIPCIÓN", "—", "sin medir todavía", null));
++    if (stats) {
++      const tok = stats.total_input_tokens + stats.total_output_tokens;
++      const failed = (stats.by_status.failed ?? 0) + (stats.by_status.timed_out ?? 0);
++      cards.append(card("HOY · EJECUCIONES", String(stats.total_runs), `${fmtTokens(tok)} tokens · ${failed} fallidas`, null));
++    }
++    const sess = sessions?.sessions ?? [];
++    const blocked = sess.filter((s) => s.needs_a_human_hand).length;
++    cards.append(card("SESIONES CLAUDE CODE", String(sess.length), blocked ? `${blocked} esperando respuesta` : "ninguna bloqueada", null));
++
++    runsList.replaceChildren();
++    const rs = runs?.runs ?? [];
++    if (!rs.length) runsList.append(el("div", "hud-empty", "Aún no hay ejecuciones. Pídele a JARVIS que construya algo."));
++    for (const r of rs) {
++      const row = el("div", "hud-run");
++      const st = r.status ?? "queued";
++      const dot = el("span", "hud-dot " + st);
++      row.append(dot, el("span", "hud-run-text", (r.prompt ?? r.project ?? "ejecución").slice(0, 60)));
++      runsList.append(row);
++    }
++
++    termCount.textContent = ` · ${sess.length} ${sess.length === 1 ? "abierta" : "abiertas"}`;
++    chipsWrap.replaceChildren();
++    for (const s of sess) {
++      const chip = el("span", "hud-term-chip" + (s.needs_a_human_hand ? " needs" : ""));
++      chip.append(el("span", "hud-dot " + (s.needs_a_human_hand ? "failed" : s.state === "working" ? "running" : "idle")), s.project ?? "sesión");
++      chip.title = s.state ?? "";
++      chipsWrap.append(chip);
++    }
++  }
++  refresh();
++  setInterval(refresh, 15000);
++
++  return { refresh };
++}
+diff --git a/frontend/src/main.ts b/frontend/src/main.ts
+index 9c26565..c8af96a 100644
+--- a/frontend/src/main.ts
++++ b/frontend/src/main.ts
+@@ -9,6 +9,8 @@ import { createOrb, type OrbState } from "./orb";
+ import { createVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
+ import { createSocket } from "./ws";
+ import { openSettings, checkFirstTimeSetup } from "./settings";
++import { createChat } from "./chat";
++import { createHud } from "./hud";
+ import "./style.css";
+ 
+ // ---------------------------------------------------------------------------
+@@ -63,6 +65,7 @@ function transition(newState: State) {
+   const btn = document.getElementById("hush");
+   if (btn) (btn as HTMLButtonElement).hidden = newState !== "speaking";
+   orb.setState(newState as OrbState);
++  chat.setState(newState);
+   updateStatus(newState);
+ 
+   if (isMuted) return;
+@@ -81,6 +84,7 @@ const voiceInput = createVoiceInput(
+   (text: string) => {
+     // The server decides whether this is echo, a barge-in, or a new turn.
+     micMonitor.sawSpeech();
++    chat.addUser(text, true);
+     socket.send({ type: "transcript", text, isFinal: true });
+   },
+   (text: string) => {
+@@ -142,6 +146,25 @@ function hush() {
+   transition(isMuted ? "idle" : "listening");
+ }
+ 
++// Typed conversation: same wire format as a spoken final transcript.
++const chat = createChat({
++  onSend: (text: string) => socket.send({ type: "transcript", text, isFinal: true }),
++  onStop: hush,
++});
++
++// Command-centre HUD: brand/clock, live vitals, terminals bar.
++createHud({ onTalk: () => document.getElementById("btn-mute")?.click() });
++
++// Keep the orb centred in the space left between the side panels.
++function layoutOrb() {
++  const leftW = window.innerWidth >= 1200 ? 280 : 0;
++  const rightW = document.body.classList.contains("chat-open") ? Math.min(440, window.innerWidth) : 0;
++  orb.setCenterShift((leftW - rightW) / 2);
++}
++window.addEventListener("jarvis:layout", layoutOrb);
++window.addEventListener("resize", layoutOrb);
++layoutOrb();
++
+ hushBtn.addEventListener("click", hush);
+ window.addEventListener("keydown", (e: KeyboardEvent) => {
+   if (e.key === "Escape") { e.preventDefault(); hush(); }
+@@ -165,6 +188,7 @@ audioPlayer.onNeedsGesture(() => {
+ 
+ socket.onMessage((msg) => {
+   const type = msg.type as string;
++  chat.handleMessage(msg);
+ 
+   if (type === "config") {
+     muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
+diff --git a/frontend/src/orb.ts b/frontend/src/orb.ts
+index eb0450b..616ca06 100644
+--- a/frontend/src/orb.ts
++++ b/frontend/src/orb.ts
+@@ -19,10 +19,14 @@ export interface Orb {
+   setState(s: OrbState): void;
+   setAnalyser(a: AnalyserNode | null): void;
+   destroy(): void;
++  /** Shift the orb's centre horizontally by px (positive = right), eased. */
++  setCenterShift(px: number): void;
+ }
+ 
+ export function createOrb(canvas: HTMLCanvasElement): Orb {
+   let destroyed = false;
++  let shiftTarget = 0;
++  let shiftNow = 0;
+   const N = 2000;
+ 
+   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+@@ -322,6 +326,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+     camera.position.y = Math.cos(t * 0.03) * 3;
+     camera.lookAt(0, 0, cloudZ * 0.2);
+ 
++    shiftNow += (shiftTarget - shiftNow) * 0.12;
++    if (Math.abs(shiftNow - shiftTarget) < 0.1) shiftNow = shiftTarget;
++    camera.setViewOffset(window.innerWidth, window.innerHeight, -shiftNow, 0, window.innerWidth, window.innerHeight);
++
+     renderer.render(scene, camera);
+   }
+ 
+@@ -336,6 +344,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+ 
+   return {
+     setState(s: OrbState) { state = s; },
++    setCenterShift(px: number) { shiftTarget = px; },
+     setAnalyser(a: AnalyserNode | null) {
+       analyser = a;
+       if (a) freqData = new Uint8Array(a.frequencyBinCount);
