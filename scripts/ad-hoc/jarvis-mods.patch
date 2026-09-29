@@ -561,10 +561,10 @@ index 9440bda..0ab5c5c 100644
    <body>
 diff --git a/frontend/src/chat.css b/frontend/src/chat.css
 new file mode 100644
-index 0000000..a89f704
+index 0000000..adbc88d
 --- /dev/null
 +++ b/frontend/src/chat.css
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,138 @@
 +/* ════════════════════════════════════════════════════════════════════════════
 +   Chat panel — a transmission console on the right. Accent tokens come from hud.css.
 +   ════════════════════════════════════════════════════════════════════════════ */
@@ -700,6 +700,9 @@ index 0000000..a89f704
 +@keyframes chat-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 +@keyframes chat-load { 0% { left: -35%; } 100% { left: 100%; } }
 +@keyframes chat-scan { 0% { top: -140px; } 100% { top: 100%; } }
++
++/* While he talks, DETENER replaces the state pill so the title keeps its room. */
++.chat-head:has(.chat-stop:not([hidden])) .chat-pill { display: none; }
 diff --git a/frontend/src/chat.ts b/frontend/src/chat.ts
 new file mode 100644
 index 0000000..0925125
@@ -1930,10 +1933,10 @@ index 0000000..412ad02
 +}
 diff --git a/frontend/src/hud.ts b/frontend/src/hud.ts
 new file mode 100644
-index 0000000..12329ad
+index 0000000..0d46e0d
 --- /dev/null
 +++ b/frontend/src/hud.ts
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,475 @@
 +/**
 + * Command-centre HUD around the orb.
 + *
@@ -1954,7 +1957,7 @@ index 0000000..12329ad
 +import { el, svgIcon } from "./chat";
 +
 +interface LimitWindow { key: string; utilization: number | null; resets_at: number | null }
-+interface SessionRow { session_id: string; project?: string; state?: string; needs_a_human_hand?: boolean; title?: string | null; summary?: string | null }
++interface SessionRow { session_id: string; project?: string; state?: string; cwd?: string; needs_a_human_hand?: boolean; title?: string | null; summary?: string | null }
 +interface RunRow { status?: string; prompt?: string; project?: string }
 +interface Tokens { input: number; output: number; cache_read: number; cache_creation: number; total: number }
 +interface UsageScan {
@@ -2253,7 +2256,8 @@ index 0000000..12329ad
 +    }
 +
 +    // Sessions: live ones if the watcher sees them, otherwise recently active conversations.
-+    const live = sessions?.sessions ?? [];
++    // Finished sessions and JARVIS's own brains (any copy of it) are not the user's work.
++    const live = (sessions?.sessions ?? []).filter((s) => s.state !== "gone" && !/[\\/]data[\\/]jarvis$/.test(s.cwd ?? ""));
 +    const recent = (chats?.chats ?? []).filter((c) => Date.now() / 1000 - c.updated < 3 * 3600);
 +    sessList.replaceChildren();
 +    chipsWrap.replaceChildren();
