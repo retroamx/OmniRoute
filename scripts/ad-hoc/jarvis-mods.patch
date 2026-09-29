@@ -1,3 +1,201 @@
+diff --git a/agents.py b/agents.py
+new file mode 100644
+index 0000000..47693ca
+--- /dev/null
++++ b/agents.py
+@@ -0,0 +1,192 @@
++"""
++agents.py — which coding agents this machine can use, and a runner for Codex.
++
++Claude Code is JARVIS's own brain and is driven elsewhere (brain.py / run_executor.py). This module
++only *reports* on it. Codex (OpenAI's CLI) is driven here, one `codex exec` at a time, with:
++
++  * no shell — an argv list, and the prompt goes over stdin, so nothing typed can become a flag;
++  * a read-only sandbox by default (JARVIS_CODEX_SANDBOX=workspace-write to let it edit files);
++  * a working directory that must be an existing directory under the user's home;
++  * fixed-string error messages — raw CLI output is never returned to the browser.
++
++The events yielded are plain dicts: {"type": "text"|"tool"|"note"|"error"|"done", ...}.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import shutil
++import subprocess
++from pathlib import Path
++from typing import Any, AsyncIterator, Optional
++
++SANDBOXES = ("read-only", "workspace-write")
++MAX_PROMPT_CHARS = 8000
++RUN_TIMEOUT_S = 15 * 60
++
++INSTALL_HINT = {
++    "claude": "npm install -g @anthropic-ai/claude-code   y luego: claude",
++    "codex": "npm install -g @openai/codex   y luego: codex login",
++}
++
++_run_lock = asyncio.Lock()
++
++
++def find_cli(name: str) -> Optional[str]:
++    return shutil.which(name)
++
++
++def _run(argv: list[str], timeout: float = 8.0) -> Optional[subprocess.CompletedProcess]:
++    try:
++        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
++    except (OSError, subprocess.SubprocessError):
++        return None
++
++
++def _version(path: str) -> str:
++    r = _run([path, "--version"])
++    if r is None or r.returncode != 0:
++        return ""
++    return (r.stdout or r.stderr or "").strip().splitlines()[0][:60] if (r.stdout or r.stderr).strip() else ""
++
++
++def claude_status() -> dict[str, Any]:
++    path = find_cli("claude")
++    if not path:
++        return {"id": "claude", "name": "Claude Code", "installed": False, "logged_in": False, "version": "", "hint": INSTALL_HINT["claude"]}
++    logged = False
++    r = _run([path, "auth", "status"])
++    if r is not None and r.returncode == 0:
++        try:
++            logged = bool(json.loads(r.stdout).get("loggedIn"))
++        except ValueError:
++            logged = "loggedin\": true" in r.stdout.lower().replace(" ", "")
++    return {"id": "claude", "name": "Claude Code", "installed": True, "logged_in": logged, "version": _version(path),
++            "hint": "" if logged else "Ejecuta: claude   (inicia sesión en el navegador)"}
++
++
++def codex_status() -> dict[str, Any]:
++    path = find_cli("codex")
++    if not path:
++        return {"id": "codex", "name": "Codex", "installed": False, "logged_in": False, "version": "", "hint": INSTALL_HINT["codex"]}
++    r = _run([path, "login", "status"])
++    text = ((r.stdout or "") + (r.stderr or "")).lower() if r is not None else ""
++    logged = r is not None and r.returncode == 0 and "not logged in" not in text
++    return {"id": "codex", "name": "Codex", "installed": True, "logged_in": logged, "version": _version(path),
++            "hint": "" if logged else "Ejecuta: codex login   (con tu cuenta de ChatGPT)"}
++
++
++def status() -> list[dict[str, Any]]:
++    return [claude_status(), codex_status()]
++
++
++def resolve_cwd(cwd: Optional[str]) -> Optional[Path]:
++    """An existing directory inside the user's home, or None. Home itself is the default."""
++    home = Path.home().resolve()
++    try:
++        p = Path(cwd).expanduser().resolve() if cwd else home
++    except (OSError, RuntimeError, ValueError):
++        return None
++    if not p.is_dir():
++        return None
++    try:
++        p.relative_to(home)
++    except ValueError:
++        return None
++    return p
++
++
++def _sandbox() -> str:
++    v = os.environ.get("JARVIS_CODEX_SANDBOX", "read-only").strip()
++    return v if v in SANDBOXES else "read-only"
++
++
++def _child_env() -> dict[str, str]:
++    # Codex has no business with JARVIS's own keys or Anthropic credentials.
++    return {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_") and k not in ("FISH_API_KEY",)}
++
++
++def parse_event(line: str) -> list[dict[str, Any]]:
++    """One line of `codex exec --json` -> zero or more UI events. Unknown shapes are ignored."""
++    line = line.strip()
++    if not line.startswith("{"):
++        return []
++    try:
++        ev = json.loads(line)
++    except ValueError:
++        return []
++    kind = ev.get("type")
++    item = ev.get("item") or {}
++    itype = item.get("type")
++    if kind == "item.completed" and itype == "agent_message" and item.get("text"):
++        return [{"type": "text", "text": str(item["text"])}]
++    if kind in ("item.started", "item.completed") and itype in ("command_execution", "mcp_tool_call", "file_change", "web_search"):
++        label = {"command_execution": "shell", "mcp_tool_call": "tool", "file_change": "edición", "web_search": "web"}[itype]
++        return [{"type": "tool", "name": label}] if kind == "item.started" else []
++    if kind in ("turn.failed", "error"):
++        return [{"type": "error", "text": "Codex no pudo completar la petición."}]
++    return []
++
++
++async def run_codex(prompt: str, cwd: Optional[str] = None) -> AsyncIterator[dict[str, Any]]:
++    prompt = (prompt or "").strip()
++    if not prompt:
++        yield {"type": "error", "text": "El mensaje está vacío."}
++        return
++    if len(prompt) > MAX_PROMPT_CHARS:
++        yield {"type": "error", "text": f"El mensaje es demasiado largo (máximo {MAX_PROMPT_CHARS} caracteres)."}
++        return
++    st = await asyncio.to_thread(codex_status)
++    if not st["installed"]:
++        yield {"type": "error", "text": "Codex no está instalado.", "hint": INSTALL_HINT["codex"], "setup": True}
++        return
++    if not st["logged_in"]:
++        yield {"type": "error", "text": "Codex no tiene la sesión iniciada.", "hint": st["hint"], "setup": True}
++        return
++    workdir = resolve_cwd(cwd)
++    if workdir is None:
++        yield {"type": "error", "text": "La carpeta de trabajo no es válida (debe existir y estar dentro de tu carpeta personal)."}
++        return
++    if _run_lock.locked():
++        yield {"type": "error", "text": "Codex ya está ocupado con otra petición."}
++        return
++
++    async with _run_lock:
++        argv = [find_cli("codex") or "codex", "exec", "--skip-git-repo-check", "--sandbox", _sandbox(),
++                "--json", "-C", str(workdir), "-"]
++        try:
++            proc = await asyncio.create_subprocess_exec(
++                *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
++                stderr=asyncio.subprocess.DEVNULL, env=_child_env())
++        except OSError:
++            yield {"type": "error", "text": "No se pudo iniciar Codex."}
++            return
++        yield {"type": "note", "text": f"Codex trabajando en {workdir.name or str(workdir)} · sandbox {_sandbox()}"}
++        assert proc.stdin is not None and proc.stdout is not None
++        try:
++            proc.stdin.write(prompt.encode("utf-8"))
++            await proc.stdin.drain()
++            proc.stdin.close()
++        except (OSError, ConnectionError):
++            pass
++        got_text = False
++        try:
++            async with asyncio.timeout(RUN_TIMEOUT_S):
++                while True:
++                    raw = await proc.stdout.readline()
++                    if not raw:
++                        break
++                    for ev in parse_event(raw.decode("utf-8", "replace")):
++                        got_text = got_text or ev["type"] == "text"
++                        yield ev
++        except TimeoutError:
++            yield {"type": "error", "text": "Codex tardó demasiado y se detuvo."}
++        finally:
++            # Also runs when the browser disconnects mid-stream: never leave the child running.
++            if proc.returncode is None:
++                proc.kill()
++            await proc.wait()
++        if proc.returncode not in (0, None) and not got_text:
++            yield {"type": "error", "text": "Codex terminó con un error. Comprueba tu sesión (codex login) y tu conexión."}
++        yield {"type": "done"}
 diff --git a/chats_view.py b/chats_view.py
 new file mode 100644
 index 0000000..a363a29
@@ -196,10 +394,10 @@ index 9440bda..5c274c4 100644
    <body>
 diff --git a/frontend/src/chat.css b/frontend/src/chat.css
 new file mode 100644
-index 0000000..a183487
+index 0000000..cfdfb22
 --- /dev/null
 +++ b/frontend/src/chat.css
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,251 @@
 +/* Chat panel — glass surface over the orb, in the existing cyan-on-black palette. */
 +
 +:root {
@@ -445,12 +643,18 @@ index 0000000..a183487
 +.chat-skill:hover { background: var(--chat-accent-soft); border-color: rgba(56, 189, 248, 0.5); transform: translateY(-1px); }
 +.chat-skill-title { font-size: 12.5px; font-weight: 600; }
 +.chat-skill-hint { font-size: 10.5px; color: var(--chat-dim); }
++
++.msg-note { align-self: center; max-width: 92%; text-align: center; font-size: 11.5px; line-height: 1.55; color: var(--chat-dim); padding: 4px 10px; animation: chat-in 0.22s ease-out; }
++.msg-note code { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; background: rgba(0, 0, 0, 0.4); padding: 2px 7px; border-radius: 5px; color: #e6f3ff; }
++.msg-note.error { color: #fca5a5; }
++body[data-agent="codex"] .chat-avatar { background: radial-gradient(circle at 30% 25%, #b9f6ca, #10a37f 70%); box-shadow: 0 0 18px rgba(16, 163, 127, 0.5); }
++body[data-agent="codex"] { --chat-accent: #34d399; }
 diff --git a/frontend/src/chat.ts b/frontend/src/chat.ts
 new file mode 100644
-index 0000000..53b4789
+index 0000000..814603e
 --- /dev/null
 +++ b/frontend/src/chat.ts
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,371 @@
 +/**
 + * Chat panel — type to JARVIS and read his replies as a conversation.
 + *
@@ -476,6 +680,13 @@ index 0000000..53b4789
 +  toggle(force?: boolean): void;
 +  /** Send a message as if typed, opening the panel. */
 +  ask(text: string): void;
++  /** Which agent is answering: changes the header label and accent. */
++  setAgent(id: string, name: string): void;
++  /** A complete reply from an agent that is not the voice brain (Codex). */
++  botMessage(text: string): void;
++  /** A small centred line: progress, tool use, setup instructions, errors. */
++  botNote(text: string, kind?: "info" | "error"): void;
++  setTyping(on: boolean): void;
 +}
 +
 +const SKILLS: { title: string; hint: string; prompt: string }[] = [
@@ -558,7 +769,8 @@ index 0000000..53b4789
 +  const header = el("header", "chat-head");
 +  const avatar = el("div", "chat-avatar", "J");
 +  const titles = el("div", "chat-titles");
-+  titles.append(el("div", "chat-title", "JARVIS"), el("div", "chat-sub", "impulsado por Claude Code"));
++  const subEl = el("div", "chat-sub", "impulsado por Claude Code");
++  titles.append(el("div", "chat-title", "JARVIS"), subEl);
 +  const pill = el("div", "chat-pill");
 +  const pillDot = el("span", "chat-pill-dot");
 +  const pillText = el("span", "chat-pill-text", STATE_LABEL.idle);
@@ -778,7 +990,38 @@ index 0000000..53b4789
 +  toggle(remembered || window.innerWidth >= 1000);
 +  void state;
 +
++  function botMessage(text: string) {
++    const clean = text.trim();
++    if (!clean) return;
++    showTyping(false);
++    dropEmpty();
++    replyBody = null;
++    replyUtt = null;
++    const row = el("div", "msg msg-bot");
++    const bubble = el("div", "bubble");
++    const body = el("div", "bubble-body");
++    renderRich(body, clean);
++    bubble.append(body, el("div", "stamp", clock()));
++    row.append(bubble);
++    list.append(row);
++    scrollDown();
++  }
++
++  function botNote(text: string, kind: "info" | "error" = "info") {
++    showTyping(false);
++    dropEmpty();
++    const note = el("div", "msg-note" + (kind === "error" ? " error" : ""));
++    renderRich(note, text);
++    list.append(note);
++    scrollDown();
++  }
++
 +  return {
++    botMessage, botNote, setTyping: showTyping,
++    setAgent(id: string, name: string) {
++      subEl.textContent = `impulsado por ${name}`;
++      document.body.dataset.agent = id;
++    },
 +    addUser, handleMessage, setState, toggle,
 +    ask(text: string) { toggle(true); send(text); },
 +  };
@@ -1118,10 +1361,10 @@ index 0000000..e0a44d3
 +}
 diff --git a/frontend/src/hud.css b/frontend/src/hud.css
 new file mode 100644
-index 0000000..9314299
+index 0000000..8fd767e
 --- /dev/null
 +++ b/frontend/src/hud.css
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,125 @@
 +/* Command-centre HUD — sits over the orb; hidden on narrow screens. */
 +
 +.hud-brand { position: fixed; top: 22px; left: 28px; z-index: 12; color: #e6f3ff; pointer-events: none; }
@@ -1240,12 +1483,19 @@ index 0000000..9314299
 +
 +@keyframes hud-breathe { 50% { box-shadow: 0 0 16px hsla(var(--orb-h, 200), 90%, 60%, 0.35); } }
 +@keyframes hud-bar { 0%, 100% { height: 5px; } 50% { height: 17px; } }
++
++.hud-mode { display: inline-flex; align-items: center; gap: 8px; }
++.hud-mode-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
++.hud-mode-dot.ok { background: #34d399; box-shadow: 0 0 7px #34d399; }
++.hud-mode-dot.warn { background: #fbbf24; }
++.hud-mode-dot.off { background: #64748b; }
++.hud-mode:disabled { opacity: 1; cursor: pointer; }
 diff --git a/frontend/src/hud.ts b/frontend/src/hud.ts
 new file mode 100644
-index 0000000..5ce2861
+index 0000000..83ea0f1
 --- /dev/null
 +++ b/frontend/src/hud.ts
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,264 @@
 +/**
 + * Command-centre HUD around the orb: brand + clock, mode switch, live vitals
 + * (subscription windows, today's runs, recent runs) and a terminals bar that
@@ -1315,7 +1565,9 @@ index 0000000..5ce2861
 +  compacting: "Reorganizando memoria…",
 +};
 +
-+export function createHud(opts: { onTalk(): void; onChats(): void; onLang(code: string): void }) {
++export interface AgentInfo { id: string; name: string; installed: boolean; logged_in: boolean; version: string; hint: string }
++
++export function createHud(opts: { onTalk(): void; onChats(): void; onLang(code: string): void; onAgent(id: string): void }) {
 +  // ── top-left: brand + clock ──────────────────────────────────────────────
 +  const brand = el("div", "hud-brand");
 +  const title = el("div", "hud-title");
@@ -1327,12 +1579,15 @@ index 0000000..5ce2861
 +
 +  // ── top-centre: mode switch ──────────────────────────────────────────────
 +  const modes = el("div", "hud-modes");
-+  const mClaude = el("button", "hud-mode active", "Claude Code");
-+  const mCodex = el("button", "hud-mode", "Codex");
-+  mClaude.type = mCodex.type = "button";
-+  mCodex.disabled = true;
-+  mCodex.title = "No disponible en esta versión de JARVIS";
-+  modes.append(mClaude, mCodex);
++  const modeBtns: Record<string, HTMLButtonElement> = {};
++  for (const [id, label] of [["claude", "Claude Code"], ["codex", "Codex"]] as const) {
++    const b = el("button", "hud-mode");
++    b.type = "button";
++    b.append(el("span", "hud-mode-dot"), document.createTextNode(label));
++    b.addEventListener("click", () => opts.onAgent(id));
++    modeBtns[id] = b;
++    modes.append(b);
++  }
 +
 +  // ── left: vitals ─────────────────────────────────────────────────────────
 +  const left = el("aside", "hud-left");
@@ -1475,10 +1730,38 @@ index 0000000..5ce2861
 +    heardTimer = window.setTimeout(() => heard.classList.remove("show"), final ? 3500 : 6000);
 +  }
 +
-+  return { refresh, setTalk, setHeard };
++  let agentInfo: AgentInfo[] = [];
++
++  // Green = installed and signed in; amber = installed but signed out; grey = not installed.
++  function paintAgents(list: AgentInfo[]) {
++    agentInfo = list;
++    for (const a of list) {
++      const b = modeBtns[a.id];
++      if (!b) continue;
++      const dot = b.querySelector(".hud-mode-dot") as HTMLElement;
++      dot.className = "hud-mode-dot " + (a.installed ? (a.logged_in ? "ok" : "warn") : "off");
++      b.title = a.installed
++        ? (a.logged_in ? `${a.name} listo · ${a.version}` : `${a.name} instalado, falta iniciar sesión. ${a.hint}`)
++        : `${a.name} no está instalado. ${a.hint}`;
++    }
++  }
++
++  async function refreshAgents(): Promise<AgentInfo[]> {
++    const data = await getJson<{ agents: AgentInfo[] }>("/api/agents");
++    if (data) paintAgents(data.agents);
++    return agentInfo;
++  }
++  void refreshAgents();
++  setInterval(refreshAgents, 30000);
++
++  function setAgent(id: string) {
++    for (const [k, b] of Object.entries(modeBtns)) b.classList.toggle("active", k === id);
++  }
++
++  return { refresh, setTalk, setHeard, setAgent, refreshAgents };
 +}
 diff --git a/frontend/src/main.ts b/frontend/src/main.ts
-index 9c26565..c2bf91e 100644
+index 9c26565..cbe448b 100644
 --- a/frontend/src/main.ts
 +++ b/frontend/src/main.ts
 @@ -6,9 +6,12 @@
@@ -1490,7 +1773,7 @@ index 9c26565..c2bf91e 100644
  import { createSocket } from "./ws";
  import { openSettings, checkFirstTimeSetup } from "./settings";
 +import { createChat } from "./chat";
-+import { createHud } from "./hud";
++import { createHud, type AgentInfo } from "./hud";
 +import { createChats } from "./chats";
  import "./style.css";
  
@@ -1515,21 +1798,24 @@ index 9c26565..c2bf91e 100644
    updateStatus(newState);
  
    if (isMuted) return;
-@@ -81,10 +86,13 @@ const voiceInput = createVoiceInput(
+@@ -81,11 +86,14 @@ const voiceInput = createVoiceInput(
    (text: string) => {
      // The server decides whether this is echo, a barge-in, or a new turn.
      micMonitor.sawSpeech();
+-    socket.send({ type: "transcript", text, isFinal: true });
 +    chat.addUser(text, true);
 +    hud.setHeard(text, true);
-     socket.send({ type: "transcript", text, isFinal: true });
++    routeToAgent(text);
    },
    (text: string) => {
      micMonitor.sawSpeech();
+-    socket.send({ type: "interim", text });
 +    hud.setHeard(text, false);
-     socket.send({ type: "interim", text });
++    if (agent === "claude") socket.send({ type: "interim", text });
    },
    (msg: string) => {
-@@ -111,6 +119,7 @@ const micMonitor = createMicMonitor(
+     showError(msg);
+@@ -111,16 +119,61 @@ const micMonitor = createMicMonitor(
      const pct = Math.min(100, Math.round(level * 900));
      micDot.style.setProperty("--level", `${pct}%`);
      micDot.classList.toggle("is-hot", level > 0.02);
@@ -1537,7 +1823,17 @@ index 9c26565..c2bf91e 100644
    },
    (event: string) => {
      socket.send({ type: "mic", text: event });
-@@ -121,6 +130,43 @@ const micMonitor = createMicMonitor(
+     // Proven deaf: sound going in, nothing coming out. Do not wait for the
+     // rotation timer to happen along — measured once at 21 seconds, all of
+     // it lost. Rebuild the recogniser now.
+-    if (event.startsWith("DEAF")) voiceInput.restart("deaf: audio in, no results");
++    if (event.startsWith("DEAF")) {
++      voiceInput.restart("deaf: audio in, no results");
++      if (Date.now() - deafShownAt > 30000) {
++        deafShownAt = Date.now();
++        showError("Oigo sonido pero el reconocimiento no devuelve texto. Revisa: internet, el idioma del selector y que uses Chrome.");
++      }
++    }
    }
  );
  
@@ -1545,6 +1841,7 @@ index 9c26565..c2bf91e 100644
 +// Normalised against a noise floor, with hysteresis so the "hearing you" state neither
 +// flickers on breaths nor lingers after you stop. While JARVIS is talking (or the mic is
 +// muted) the level is forced to zero: his own voice comes back through the microphone.
++let deafShownAt = 0;
 +let voiceActive = false;
 +let voiceOnAt = 0;
 +let lastLoudAt = 0;
@@ -1581,13 +1878,67 @@ index 9c26565..c2bf91e 100644
  // ── stopping him ──────────────────────────────────────────────────────────
  // Escape, or the button that appears while he is talking. Not a spoken word:
  // his voice comes back through the microphone garbled, and a mis-hear that
-@@ -142,6 +188,34 @@ function hush() {
+@@ -142,6 +195,110 @@ function hush() {
    transition(isMuted ? "idle" : "listening");
  }
  
++// ── which agent answers: Claude Code (JARVIS's own brain) or Codex ─────────────────────────────
++type Agent = "claude" | "codex";
++let agent: Agent = "claude";
++try { if (localStorage.getItem("jarvis.agent") === "codex") agent = "codex"; } catch { /* storage blocked */ }
++const AGENT_NAME: Record<Agent, string> = { claude: "Claude Code", codex: "Codex" };
++
++// One Codex turn: POST, then read newline-delimited JSON events as they arrive.
++async function sendToCodex(text: string) {
++  try {
++    const r = await fetch("/api/agents/codex/exec", {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ prompt: text }),
++    });
++    if (!r.ok || !r.body) {
++      chat.botNote("No se pudo contactar con Codex a través del servidor de JARVIS.", "error");
++      return;
++    }
++    const reader = r.body.getReader();
++    const dec = new TextDecoder();
++    let buf = "";
++    for (;;) {
++      const { value, done } = await reader.read();
++      if (done) break;
++      buf += dec.decode(value, { stream: true });
++      let nl: number;
++      while ((nl = buf.indexOf("\n")) >= 0) {
++        const line = buf.slice(0, nl).trim();
++        buf = buf.slice(nl + 1);
++        if (!line) continue;
++        let ev: { type: string; text?: string; name?: string; hint?: string };
++        try { ev = JSON.parse(line); } catch { continue; }
++        if (ev.type === "text" && ev.text) chat.botMessage(ev.text);
++        else if (ev.type === "tool") chat.botNote(`⚙ Codex usa: ${ev.name ?? "herramienta"}`);
++        else if (ev.type === "note" && ev.text) chat.botNote(ev.text);
++        else if (ev.type === "error") {
++          chat.botNote(ev.text ?? "Error de Codex.", "error");
++          if (ev.hint) chat.botNote(`\`${ev.hint}\``);
++          void hud.refreshAgents();
++        }
++      }
++    }
++  } catch {
++    chat.botNote("Se perdió la conexión con JARVIS mientras Codex trabajaba.", "error");
++  } finally {
++    chat.setTyping(false);
++  }
++}
++
++function routeToAgent(text: string) {
++  if (agent === "codex") void sendToCodex(text);
++  else socket.send({ type: "transcript", text, isFinal: true });
++}
++
 +// Typed conversation: same wire format as a spoken final transcript.
 +const chat = createChat({
-+  onSend: (text: string) => socket.send({ type: "transcript", text, isFinal: true }),
++  onSend: (text: string) => routeToAgent(text),
 +  onStop: hush,
 +});
 +
@@ -1596,12 +1947,34 @@ index 9c26565..c2bf91e 100644
 +const hud = createHud({
 +  onTalk: () => document.getElementById("btn-mute")?.click(),
 +  onChats: () => chats.open(),
++  onAgent: (id: string) => selectAgent(id === "codex" ? "codex" : "claude"),
 +  onLang: (code: string) => {
 +    setVoiceLang(code);
 +    voiceInput.restart("language changed");
 +    showError(`Idioma de voz: ${code}`);
 +  },
 +});
++
++async function selectAgent(next: Agent) {
++  agent = next;
++  try { localStorage.setItem("jarvis.agent", next); } catch { /* ignore */ }
++  hud.setAgent(next);
++  chat.setAgent(next, AGENT_NAME[next]);
++  chat.toggle(true);
++  const info: AgentInfo | undefined = (await hud.refreshAgents()).find((a) => a.id === next);
++  if (!info) return;
++  if (!info.installed) {
++    chat.botNote(`${info.name} no está instalado en este ordenador. Para usarlo, ejecuta en una terminal:`, "error");
++    chat.botNote(`\`${info.hint}\``);
++  } else if (!info.logged_in) {
++    chat.botNote(`${info.name} está instalado pero no tiene la sesión iniciada.`, "error");
++    chat.botNote(`\`${info.hint}\``);
++  } else {
++    chat.botNote(`Ahora respondes con ${info.name} (${info.version}). ${next === "codex" ? "Codex trabaja en modo solo lectura y en tu carpeta personal." : "Es el cerebro de voz de JARVIS."}`);
++  }
++}
++hud.setAgent(agent);
++chat.setAgent(agent, AGENT_NAME[agent]);
 +
 +// Keep the orb centred in the space left between the side panels.
 +function layoutOrb() {
@@ -1616,7 +1989,7 @@ index 9c26565..c2bf91e 100644
  hushBtn.addEventListener("click", hush);
  window.addEventListener("keydown", (e: KeyboardEvent) => {
    if (e.key === "Escape") { e.preventDefault(); hush(); }
-@@ -165,6 +239,7 @@ audioPlayer.onNeedsGesture(() => {
+@@ -165,6 +322,7 @@ audioPlayer.onNeedsGesture(() => {
  
  socket.onMessage((msg) => {
    const type = msg.type as string;
@@ -1624,7 +1997,7 @@ index 9c26565..c2bf91e 100644
  
    if (type === "config") {
      muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
-@@ -238,6 +313,8 @@ btnMute.addEventListener("click", (e) => {
+@@ -238,6 +396,8 @@ btnMute.addEventListener("click", (e) => {
    e.stopPropagation();
    isMuted = !isMuted;
    btnMute.classList.toggle("muted", isMuted);
@@ -1772,10 +2145,37 @@ index a6742f0..b541921 100644
        return true;
      }
 diff --git a/frontend/src/voice.ts b/frontend/src/voice.ts
-index b564ab3..ddccd95 100644
+index b564ab3..f647e79 100644
 --- a/frontend/src/voice.ts
 +++ b/frontend/src/voice.ts
-@@ -93,6 +93,33 @@ declare const webkitSpeechRecognition: any;
+@@ -58,6 +58,26 @@ const RESTART_DELAY_MS = 250;
+ const ROTATE_AFTER_MS = 6000;
+ const DEDUPE_WINDOW_MS = 2500;
+ 
++// Endpointing. Relying on Chrome's own `isFinal` left JARVIS hearing you and never answering: in
++// continuous mode Chrome can hold a sentence open for a long time (or forever, with background
++// noise or the wrong language). So JARVIS decides for itself: when no new words have arrived for
++// ENDPOINT_MS, what was heard is sent as the finished sentence. A sentence that trails off on a
++// connector ("y…", "pero…", "because…") or a comma gets the longer pause, since more is coming.
++const ENDPOINT_MS = 1800;
++const ENDPOINT_LONG_MS = 3200;
++const UNFINISHED_TAIL = new Set([
++  "y", "e", "o", "u", "pero", "que", "porque", "como", "con", "de", "del", "para", "por", "a", "en", "el", "la",
++  "los", "las", "un", "una", "mi", "tu", "su", "si", "pues", "entonces", "aunque", "cuando",
++  "and", "but", "or", "so", "that", "because", "with", "of", "to", "the", "a", "an", "my", "your", "if", "um", "uh", "then",
++]);
++
++function endpointDelay(text: string): number {
++  const t = text.trim();
++  if (/[,;:]$/.test(t)) return ENDPOINT_LONG_MS;
++  const last = (t.toLowerCase().match(/[\p{L}\p{N}']+$/u) || [""])[0];
++  return UNFINISHED_TAIL.has(last) ? ENDPOINT_LONG_MS : ENDPOINT_MS;
++}
++
+ // Chrome allows exactly ONE live SpeechRecognition. Starting a second does
+ // not overlap with the first — it ABORTS it, and an aborted session never
+ // emits the final result for whatever was being said. Measured: interims for
+@@ -93,6 +113,33 @@ declare const webkitSpeechRecognition: any;
   * live and the recogniser is the problem — which is exactly the case that
   * used to be invisible.
   */
@@ -1809,7 +2209,53 @@ index b564ab3..ddccd95 100644
  export function createMicMonitor(
    onLevel: (level: number) => void,
    onEvent: (event: string) => void
-@@ -229,7 +256,7 @@ export function createVoiceInput(
+@@ -161,6 +208,8 @@ export function createVoiceInput(
+   let waitingForRetry = false;
+   let retryDelay = 1000;
+   let lastInterimAt = 0;
++  let endpointTimer: ReturnType<typeof setTimeout> | null = null;
++  let openText = "";               // words heard but not yet sent as a finished sentence
+   let pendingInterim: string | null = null;
+   let interimFlush: ReturnType<typeof setTimeout> | null = null;
+   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+@@ -199,12 +248,35 @@ export function createVoiceInput(
+     while (recentlySent.length && now - recentlySent[0].at > DEDUPE_WINDOW_MS) {
+       recentlySent.shift();
+     }
+-    const norm = text.trim().toLowerCase();
++    // case, accents and punctuation differ between Chrome's interim and final text of the same words
++    const norm = text.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "").replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+     if (recentlySent.some((r) => r.text === norm)) return true;
+     recentlySent.push({ text: norm, at: now });
+     return false;
+   }
+ 
++  function clearEndpoint() {
++    if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
++  }
++
++  function armEndpoint() {
++    clearEndpoint();
++    endpointTimer = setTimeout(commitOpen, endpointDelay(openText));
++  }
++
++  // The pause has passed: send what was heard, then throw the recogniser's half-finished session
++  // away so Chrome cannot deliver the same sentence a second time.
++  function commitOpen() {
++    endpointTimer = null;
++    const text = openText.trim();
++    openText = "";
++    dropPendingInterim();
++    if (text.length < 2) return;
++    mark(`endpoint: sending "${text.slice(0, 60)}"`);
++    if (!isDuplicate(text)) onTranscript(text);
++    restartNow("sentence sent");
++  }
++
+   function emitInterim(text: string) {
+     lastInterimAt = Date.now();
+     pendingInterim = null;
+@@ -229,7 +301,7 @@ export function createVoiceInput(
      const sr = new SR();
      sr.continuous = true;
      sr.interimResults = true;
@@ -1818,6 +2264,75 @@ index b564ab3..ddccd95 100644
      const e: Engine = { sr, running: false, audio: false, startedAt: 0, stoppedAt: 0, retired: false };
  
      sr.onstart = () => {
+@@ -332,6 +404,8 @@ export function createVoiceInput(
+       if (result.isFinal) {
+         const text = result[0].transcript.trim();
+         dropPendingInterim();
++        clearEndpoint();
++        openText = "";
+         if (text && !isDuplicate(text)) onTranscript(text);
+       } else {
+         interim += result[0].transcript;
+@@ -339,6 +413,8 @@ export function createVoiceInput(
+     }
+     interim = interim.trim();
+     if (!interim) return;
++    openText = interim;
++    armEndpoint();
+     const wait = INTERIM_THROTTLE_MS - (Date.now() - lastInterimAt);
+     if (wait <= 0) {
+       if (interimFlush) { clearTimeout(interimFlush); interimFlush = null; }
+@@ -427,6 +503,17 @@ export function createVoiceInput(
+     }
+   }
+ 
++  function restartNow(reason: string) {
++    if (!shouldListen || paused) return;
++    mark(`restarting recogniser: ${reason}`);
++    // abort, not stop: nothing in the old session is worth waiting for, and stop() on a deaf one can hang.
++    stopAll(true);
++    lastHeardAt = Date.now();            // do not immediately rotate the new one
++    setTimeout(() => {
++      if (shouldListen && !paused) startSpare();
++    }, RESTART_DELAY_MS);
++  }
++
+   return {
+     start() {
+       shouldListen = true;
+@@ -439,11 +526,15 @@ export function createVoiceInput(
+       shouldListen = false;
+       paused = false;
+       cancelRetry();
++      clearEndpoint();
++      openText = "";
+       dropPendingInterim();
+       stopAll(false);
+     },
+     pause() {
+       paused = true;
++      clearEndpoint();
++      openText = "";
+       dropPendingInterim();
+       stopAll(false);
+     },
+@@ -457,15 +548,7 @@ export function createVoiceInput(
+       }
+     },
+     restart(reason: string) {
+-      if (!shouldListen || paused) return;
+-      mark(`restarting recogniser: ${reason}`);
+-      // abort, not stop: a deaf session has nothing worth waiting for, and
+-      // stop() on one can hang instead of ending.
+-      stopAll(true);
+-      lastHeardAt = Date.now();          // do not immediately rotate the new one
+-      setTimeout(() => {
+-        if (shouldListen && !paused) startSpare();
+-      }, RESTART_DELAY_MS);
++      restartNow(reason);
+     },
+   };
+ }
 diff --git a/preflight.py b/preflight.py
 index 01adb00..1557db5 100644
 --- a/preflight.py
@@ -1842,18 +2357,28 @@ index d301289..b2a30d3 100644
  pytest-asyncio>=0.24.0
 +edge-tts>=6.1.0
 diff --git a/server.py b/server.py
-index 4d39b05..f27eeed 100644
+index 4d39b05..d5f0e5d 100644
 --- a/server.py
 +++ b/server.py
-@@ -74,6 +74,7 @@ import repo_read
+@@ -61,7 +61,7 @@ from typing import Optional
+ 
+ import httpx
+ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+-from fastapi.responses import JSONResponse
++from fastapi.responses import JSONResponse, StreamingResponse
+ from pydantic import BaseModel
+ 
+ import actions
+@@ -74,6 +74,8 @@ import repo_read
  import run_store
  import session_steer
  import session_watch
 +import chats_view
++import agents
  import specs
  import stream_parser
  import usage_scan
-@@ -95,7 +96,17 @@ log = logging.getLogger("jarvis")
+@@ -95,7 +97,17 @@ log = logging.getLogger("jarvis")
  # Config
  # ---------------------------------------------------------------------------
  
@@ -1872,7 +2397,7 @@ index 4d39b05..f27eeed 100644
  FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
  FISH_API_URL = "https://api.fish.audio/v1/tts"
  USER_NAME = os.getenv("USER_NAME", "sir")
-@@ -611,7 +622,23 @@ async def _voice_emit(msg: dict) -> None:
+@@ -611,7 +623,23 @@ async def _voice_emit(msg: dict) -> None:
  
  
  async def _synth_for_speech(text: str) -> Optional[bytes]:
@@ -1897,10 +2422,37 @@ index 4d39b05..f27eeed 100644
      if r is None:
          return None
      _session_tokens["tts_calls"] += 1
-@@ -2253,6 +2280,23 @@ async def api_list_sessions(state: str = ""):
+@@ -2253,6 +2281,50 @@ async def api_list_sessions(state: str = ""):
      return {"sessions": rows, "projects": projects, "taken_at": snap.taken_at}
  
  
++@app.get("/api/agents")
++async def api_agents():
++    """Which coding agents (Claude Code, Codex) are installed and signed in on this machine."""
++    return {"agents": await asyncio.to_thread(agents.status)}
++
++
++@app.post("/api/agents/codex/exec")
++async def api_codex_exec(request: Request):
++    """Run one Codex turn and stream its events as newline-delimited JSON."""
++    try:
++        body = await request.json()
++    except ValueError:
++        return JSONResponse({"error": "invalid JSON"}, status_code=400)
++    if not isinstance(body, dict):
++        return JSONResponse({"error": "invalid body"}, status_code=400)
++    prompt = body.get("prompt")
++    cwd = body.get("cwd")
++    if not isinstance(prompt, str) or (cwd is not None and not isinstance(cwd, str)):
++        return JSONResponse({"error": "invalid body"}, status_code=400)
++
++    async def stream():
++        async for ev in agents.run_codex(prompt, cwd):
++            yield json.dumps(ev, ensure_ascii=False) + "\n"
++
++    return StreamingResponse(stream(), media_type="application/x-ndjson")
++
++
 +@app.get("/api/chats")
 +async def api_list_chats(q: str = "", limit: int = 200):
 +    """Every Claude Code conversation on disk (not only the live ones), newest first."""
@@ -1921,6 +2473,128 @@ index 4d39b05..f27eeed 100644
  # The tool result cap is what keeps the brain's context under budget.
  TOOL_RESULT_CAP = 1500
  
+diff --git a/tests/test_agents.py b/tests/test_agents.py
+new file mode 100644
+index 0000000..53e7c3e
+--- /dev/null
++++ b/tests/test_agents.py
+@@ -0,0 +1,116 @@
++import asyncio
++import json
++import os
++import stat
++import sys
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++
++import agents
++
++FAKE = r'''#!/usr/bin/env python3
++import json, os, sys
++a = sys.argv[1:]
++if a[:2] == ["login", "status"]:
++    if os.environ.get("FAKE_LOGGED_IN") == "1":
++        print("Logged in using ChatGPT"); sys.exit(0)
++    print("Not logged in"); sys.exit(1)
++if a[:1] == ["--version"]:
++    print("codex-cli 9.9.9"); sys.exit(0)
++if a[:1] == ["exec"]:
++    prompt = sys.stdin.read()
++    open(os.environ["FAKE_ARGV_LOG"], "w").write(json.dumps({"argv": a, "prompt": prompt}))
++    print(json.dumps({"type": "thread.started", "thread_id": "t"}))
++    print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "ls"}}))
++    print("not json noise")
++    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Hecho: " + prompt.strip()}}))
++    print(json.dumps({"type": "turn.completed"}))
++    sys.exit(0)
++'''
++
++
++@pytest.fixture
++def fake_codex(tmp_path, monkeypatch):
++    bindir = tmp_path / "bin"
++    bindir.mkdir()
++    exe = bindir / "codex"
++    exe.write_text(FAKE)
++    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
++    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ.get("PATH", ""))
++    monkeypatch.setenv("FAKE_ARGV_LOG", str(tmp_path / "argv.json"))
++    monkeypatch.setenv("FAKE_LOGGED_IN", "1")
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
++    return tmp_path
++
++
++def _collect(prompt, cwd=None):
++    async def go():
++        return [e async for e in agents.run_codex(prompt, cwd)]
++    return asyncio.run(go())
++
++
++def test_reports_codex_as_missing_when_not_on_path(monkeypatch, tmp_path):
++    monkeypatch.setenv("PATH", str(tmp_path))
++    st = agents.codex_status()
++    assert st["installed"] is False and "npm install -g @openai/codex" in st["hint"]
++    events = _collect("hola")
++    assert events[0]["type"] == "error" and events[0]["setup"] is True
++
++
++def test_not_logged_in_is_reported_with_the_login_hint(fake_codex, monkeypatch):
++    monkeypatch.setenv("FAKE_LOGGED_IN", "0")
++    st = agents.codex_status()
++    assert st["installed"] and not st["logged_in"] and "codex login" in st["hint"]
++    assert _collect("hola")[0]["setup"] is True
++
++
++def test_streams_text_and_tool_events_and_finishes(fake_codex):
++    events = _collect("cuenta hasta tres")
++    kinds = [e["type"] for e in events]
++    assert kinds == ["note", "tool", "text", "done"]
++    assert events[2]["text"] == "Hecho: cuenta hasta tres"
++
++
++def test_prompt_goes_over_stdin_never_in_argv_and_sandbox_is_read_only(fake_codex):
++    _collect("--dangerously-bypass-approvals-and-sandbox")     # would be a flag if it ever reached argv
++    logged = json.loads((fake_codex / "argv.json").read_text())
++    assert "--dangerously-bypass-approvals-and-sandbox" not in logged["argv"]
++    assert logged["prompt"] == "--dangerously-bypass-approvals-and-sandbox"
++    i = logged["argv"].index("--sandbox")
++    assert logged["argv"][i + 1] == "read-only"
++    assert "--skip-git-repo-check" in logged["argv"] and "--json" in logged["argv"]
++
++
++def test_unknown_sandbox_setting_falls_back_to_read_only(fake_codex, monkeypatch):
++    monkeypatch.setenv("JARVIS_CODEX_SANDBOX", "danger-full-access")
++    assert agents._sandbox() == "read-only"
++    monkeypatch.setenv("JARVIS_CODEX_SANDBOX", "workspace-write")
++    assert agents._sandbox() == "workspace-write"
++
++
++def test_working_directory_must_be_inside_home(fake_codex):
++    sub = fake_codex / "proyecto"
++    sub.mkdir()
++    assert agents.resolve_cwd(str(sub)) == sub.resolve()
++    assert agents.resolve_cwd("/etc") is None
++    assert agents.resolve_cwd(str(fake_codex / "no-existe")) is None
++    assert agents.resolve_cwd(str(fake_codex / ".." / "fuera")) is None
++    events = _collect("hola", "/etc")
++    assert events[0]["type"] == "error" and "carpeta" in events[0]["text"]
++
++
++def test_empty_and_oversized_prompts_are_rejected_before_any_process(fake_codex):
++    assert _collect("   ")[0]["type"] == "error"
++    assert _collect("x" * (agents.MAX_PROMPT_CHARS + 1))[0]["type"] == "error"
++    assert not (fake_codex / "argv.json").exists()
++
++
++def test_parse_event_ignores_noise_and_maps_failures_to_a_fixed_message():
++    assert agents.parse_event("garbage") == []
++    assert agents.parse_event('{"type": "weird"}') == []
++    err = agents.parse_event(json.dumps({"type": "turn.failed", "error": {"message": "SECRET /home/u/.codex/auth.json"}}))
++    assert err == [{"type": "error", "text": "Codex no pudo completar la petición."}]     # raw CLI text never leaks
 diff --git a/tests/test_anchored_patterns.py b/tests/test_anchored_patterns.py
 index 2cf0972..c2b6c80 100644
 --- a/tests/test_anchored_patterns.py
@@ -2023,13 +2697,18 @@ index 0000000..00f0230
 +        fh.write(json.dumps(_u("tres")) + "\n")
 +    assert chats_view.list_chats(root=tmp_path)[0]["messages"] == 3
 diff --git a/tests/test_header_lines.py b/tests/test_header_lines.py
-index cad6f30..2d16c30 100644
+index cad6f30..dd77942 100644
 --- a/tests/test_header_lines.py
 +++ b/tests/test_header_lines.py
-@@ -384,6 +384,16 @@ PRINTERS = _functions_that_print_a_foreign_field()
+@@ -384,6 +384,21 @@ PRINTERS = _functions_that_print_a_foreign_field()
  # to-do: every one of them is a place where a session's own words DO reach a
  # string, and the argument is why that string is safe.
  EXEMPT = {
++    "server.api_codex_exec": (
++        "`prompt` here is the user's own message from the browser's request body, not another "
++        "session's words. It goes to Codex over stdin and its answer streams back to the same "
++        "chat panel. Nothing in it reaches the brain, a tool result or speech, and Codex's "
++        "raw output is reduced to fixed strings before it is returned (see agents.parse_event)"),
 +    "chats_view.list_chats": (
 +        "it returns conversation titles read from the user's own transcript files, but only "
 +        "as JSON for the browser's Conversations panel (GET /api/chats). Nothing here builds "
