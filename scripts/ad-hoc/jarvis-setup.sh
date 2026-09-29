@@ -32,9 +32,11 @@ PATCH_ID="$(git hash-object "$PATCH" 2>/dev/null || true)"
 if [ -f "$PATCH" ] && [ "$(cat .jarvis-mods.id 2>/dev/null || true)" != "$PATCH_ID" ]; then
   echo "Aplicando la versión nueva de las mejoras de JARVIS..."
   git checkout -- . 2>/dev/null || true
-  rm -f chats_view.py tests/test_chats_view.py tests/test_voice_fallbacks.py \
-        frontend/src/chat.ts frontend/src/chat.css frontend/src/hud.ts frontend/src/hud.css \
-        frontend/src/chats.ts frontend/src/chats.css
+  # Remove every file an older copy of the patch added. The list comes from the patch itself
+  # (its "new file" entries), so it can never fall out of date again.
+  awk '/^diff --git /{f=$4; sub(/^b\//,"",f)} /^new file mode/{print f}' "$PATCH" | while IFS= read -r f; do
+    [ -n "$f" ] && rm -f -- "$f"
+  done
   git apply "$PATCH" || { echo "No se pudo aplicar el parche. Copia lo que sale arriba y envíamelo." >&2; exit 1; }
   echo "$PATCH_ID" > .jarvis-mods.id
   echo "Mejoras aplicadas (versión ${PATCH_ID:0:8})."
