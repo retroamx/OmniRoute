@@ -2380,7 +2380,7 @@ index d301289..b2a30d3 100644
  pytest-asyncio>=0.24.0
 +edge-tts>=6.1.0
 diff --git a/server.py b/server.py
-index 4d39b05..d5f0e5d 100644
+index 4d39b05..918b5e6 100644
 --- a/server.py
 +++ b/server.py
 @@ -61,7 +61,7 @@ from typing import Optional
@@ -2445,7 +2445,26 @@ index 4d39b05..d5f0e5d 100644
      if r is None:
          return None
      _session_tokens["tts_calls"] += 1
-@@ -2253,6 +2281,50 @@ async def api_list_sessions(state: str = ""):
+@@ -631,7 +659,8 @@ def _fmt_reset(ts) -> str:
+         when = datetime.fromtimestamp(float(ts))
+     except (TypeError, ValueError, OSError, OverflowError):
+         return "later"
+-    clock = when.strftime("%-I:%M %p").replace(":00 ", " ")   # "10:00 AM" -> "10 AM"
++    # No "%-I" / "%-d": that no-padding flag is glibc/BSD only and raises ValueError on Windows.
++    clock = f"{when.hour % 12 or 12}:{when.minute:02d} {when.strftime('%p')}".replace(":00 ", " ")   # "10:00 AM" -> "10 AM"
+     days = (when.date() - datetime.now().date()).days
+     if days <= 0:
+         return clock
+@@ -639,7 +668,7 @@ def _fmt_reset(ts) -> str:
+         return f"tomorrow at {clock}"
+     if days < 7:
+         return f"{when.strftime('%A')} at {clock}"
+-    return f"{when.strftime('%A %-d %B')} at {clock}"
++    return f"{when.strftime('%A')} {when.day} {when.strftime('%B')} at {clock}"
+ 
+ 
+ # True but useless: "down" names neither cause nor remedy. When the brain's
+@@ -2253,6 +2282,50 @@ async def api_list_sessions(state: str = ""):
      return {"sessions": rows, "projects": projects, "taken_at": snap.taken_at}
  
  
@@ -2496,6 +2515,19 @@ index 4d39b05..d5f0e5d 100644
  # The tool result cap is what keeps the brain's context under budget.
  TOOL_RESULT_CAP = 1500
  
+diff --git a/session_steer.py b/session_steer.py
+index 8eccd1e..1f75b19 100644
+--- a/session_steer.py
++++ b/session_steer.py
+@@ -53,6 +53,8 @@ def post_to_session(socket_path: str | None, prompt: str,
+                              "message": {"role": "user", "content": prompt.strip()}}))
+     payload = ("\n".join(lines) + "\n").encode()
+ 
++    if not hasattr(socket, "AF_UNIX"):
++        return FAILED             # Python on Windows exposes no Unix sockets: nothing to steer through
+     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+     sock.settimeout(timeout)
+     try:
 diff --git a/session_watch.py b/session_watch.py
 index fc2d0da..6827836 100644
 --- a/session_watch.py
@@ -2865,10 +2897,10 @@ index 0000000..8a49583
 +    assert asyncio.run(tts.synthesize_local("")) is None
 diff --git a/tests/test_windows_compat.py b/tests/test_windows_compat.py
 new file mode 100644
-index 0000000..d97a2c5
+index 0000000..8708afc
 --- /dev/null
 +++ b/tests/test_windows_compat.py
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,100 @@
 +import os
 +import sys
 +from pathlib import Path
@@ -2927,6 +2959,48 @@ index 0000000..d97a2c5
 +    assert session_watch.pid_alive(-5) is False
 +    assert session_watch.pid_alive("abc") is False
 +    assert session_watch.pid_alive(2 ** 22 + 12345) is False
++
++
++def test_usage_scan_imports_and_bounds_hold_on_windows(monkeypatch):
++    """`datetime(2, 1, 1).timestamp()` raised OSError at import on Windows, so the server never started."""
++    import importlib
++    import usage_scan
++    monkeypatch.setattr(os, "name", "nt")
++    mod = importlib.reload(usage_scan)
++    try:
++        assert mod._DAY_MIN > 0                                  # Windows fromtimestamp rejects negatives
++        assert mod._DAY_MAX < 32536799999                        # ...and anything past year 3000
++        assert mod._epoch("1970-01-01T00:00:00.000Z") is None    # too close to the epoch to place locally
++        assert mod._epoch("2026-09-29T10:00:00.000Z") is not None
++    finally:
++        monkeypatch.setattr(os, "name", "posix")
++        importlib.reload(usage_scan)
++
++
++def test_usage_scan_bounds_unchanged_off_windows():
++    import usage_scan
++    assert usage_scan._epoch("0001-01-01T00:00:00.000Z") is None
++    assert usage_scan._epoch("2026-09-29T10:00:00.000Z") is not None
++
++
++def test_reset_time_wording_uses_no_platform_specific_strftime_flags():
++    """`%-I` and `%-d` raise ValueError on Windows; the spoken wording must not depend on them."""
++    from datetime import datetime, timedelta
++    import server
++    base = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
++    assert server._fmt_reset((base + timedelta(days=1)).timestamp()) == "tomorrow at 10 AM"
++    far = base + timedelta(days=9)
++    assert server._fmt_reset(far.timestamp()) == f"{far.strftime('%A')} {far.day} {far.strftime('%B')} at 10 AM"
++    assert server._fmt_reset(base.replace(hour=15, minute=30).timestamp() + 86400).endswith("3:30 PM")
++
++
++def test_steer_without_unix_sockets_fails_cleanly(monkeypatch, tmp_path):
++    import socket
++    import session_steer
++    sock_file = tmp_path / "s.sock"
++    sock_file.write_text("")                 # present, so the call gets as far as opening a socket
++    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
++    assert session_steer.post_to_session(str(sock_file), "hola") == session_steer.FAILED
 diff --git a/tts.py b/tts.py
 index 722c001..951cb26 100644
 --- a/tts.py
@@ -2999,3 +3073,37 @@ index 722c001..951cb26 100644
 +    if not buf:
 +        return None
 +    return SynthResult(bytes(buf), first if first is not None else 0.0, time.monotonic() - t0)
+diff --git a/usage_scan.py b/usage_scan.py
+index 7aa2dd6..ccb0d3c 100644
+--- a/usage_scan.py
++++ b/usage_scan.py
+@@ -67,7 +67,7 @@ import logging
+ import os
+ import time
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import datetime, timezone
+ from pathlib import Path
+ 
+ import session_watch
+@@ -158,8 +158,18 @@ def _tokens_from(usage) -> Tokens:
+ # `fromisoformat` accepts that string happily, so catching only its ValueError
+ # left the second call unguarded. Two years of slack at each end covers every
+ # UTC offset without needing to know the local one.
+-_DAY_MIN = datetime(2, 1, 1).timestamp()
+-_DAY_MAX = datetime(9997, 1, 1).timestamp()
++#
++# Computed from UTC-aware datetimes: a naive `datetime(2, 1, 1).timestamp()` asks the OS
++# for LOCAL time in year 2, which Windows cannot do (OSError: [Errno 22]) — JARVIS then
++# failed at import and never started there. Windows' `fromtimestamp` also only accepts
++# moments from the epoch to year 3000, so the window is narrowed to that range there,
++# again with two days of slack for the UTC offset.
++if os.name == "nt":
++    _DAY_MIN = 2 * 86400.0
++    _DAY_MAX = datetime(2999, 12, 29, tzinfo=timezone.utc).timestamp()
++else:
++    _DAY_MIN = datetime(2, 1, 1, tzinfo=timezone.utc).timestamp()
++    _DAY_MAX = datetime(9997, 1, 1, tzinfo=timezone.utc).timestamp()
+ 
+ 
+ def _epoch(stamp) -> float | None:
