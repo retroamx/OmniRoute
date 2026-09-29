@@ -380,6 +380,29 @@ index 0000000..a363a29
 +        "total": total,
 +        "messages": out[max(after, 0):][:limit],
 +    }
+diff --git a/data_paths.py b/data_paths.py
+index f20b175..4c1349a 100644
+--- a/data_paths.py
++++ b/data_paths.py
+@@ -386,6 +386,18 @@ def ensure_tool_token() -> str:
+             os.close(fd)
+         return token
+ 
++    if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "getuid") and hasattr(os, "fchmod")):
++        # Windows has no O_NOFOLLOW, uid or fchmod, so the descriptor-based checks below cannot run
++        # (and used to crash JARVIS on its second start). The profile folder is already private to
++        # this user by its ACLs; keep the checks that do exist: a plain file, not a symlink.
++        if path.is_symlink() or not path.is_file():
++            raise OSError(f"{path} is not a regular file")
++        existing = path.read_text(encoding="utf-8", errors="ignore").strip()
++        if existing:
++            return existing
++        path.write_text(token, encoding="utf-8")
++        return token
++
+     fd = os.open(str(path), os.O_RDWR | os.O_NOFOLLOW)
+     try:
+         info = os.fstat(fd)
 diff --git a/frontend/index.html b/frontend/index.html
 index 9440bda..5c274c4 100644
 --- a/frontend/index.html
@@ -2473,6 +2496,60 @@ index 4d39b05..d5f0e5d 100644
  # The tool result cap is what keeps the brain's context under budget.
  TOOL_RESULT_CAP = 1500
  
+diff --git a/session_watch.py b/session_watch.py
+index fc2d0da..6827836 100644
+--- a/session_watch.py
++++ b/session_watch.py
+@@ -48,14 +48,46 @@ def pid_alive(pid) -> bool:
+     """
+     try:
+         pid = int(pid)
+-        if pid <= 0:
+-            return False
++    except (TypeError, ValueError):
++        return False
++    if pid <= 0:
++        return False
++    if _IS_WINDOWS:
++        # On Windows os.kill() does NOT probe: any signal other than Ctrl+C/Ctrl+Break calls
++        # TerminateProcess. Signal 0 here would have killed the user's Claude Code sessions.
++        return _pid_alive_windows(pid)
++    try:
+         os.kill(pid, 0)
+-    except (OSError, TypeError, ValueError):
++    except OSError:
+         return False
+     return True
+ 
+ 
++_IS_WINDOWS = os.name == "nt"
++
++
++def _pid_alive_windows(pid: int) -> bool:
++    """Ask the OS whether the process is still running, without any way of touching it."""
++    try:
++        import ctypes
++        from ctypes import wintypes
++
++        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++        k32.OpenProcess.restype = wintypes.HANDLE
++        handle = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
++        if not handle:
++            return ctypes.get_last_error() == 5              # ERROR_ACCESS_DENIED: it exists, we may not open it
++        try:
++            code = wintypes.DWORD()
++            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
++                return False
++            return code.value == 259                         # STILL_ACTIVE
++        finally:
++            k32.CloseHandle(handle)
++    except (OSError, AttributeError, ValueError):
++        return False
++
++
+ def encode_cwd(cwd: str) -> str:
+     """The CLI's transcript directory name: EVERY non-alphanumeric becomes `-`.
+ 
 diff --git a/tests/test_agents.py b/tests/test_agents.py
 new file mode 100644
 index 0000000..53e7c3e
@@ -2786,6 +2863,70 @@ index 0000000..8a49583
 +def test_empty_text_is_never_synthesised():
 +    assert asyncio.run(tts.synthesize_edge("   ")) is None
 +    assert asyncio.run(tts.synthesize_local("")) is None
+diff --git a/tests/test_windows_compat.py b/tests/test_windows_compat.py
+new file mode 100644
+index 0000000..d97a2c5
+--- /dev/null
++++ b/tests/test_windows_compat.py
+@@ -0,0 +1,58 @@
++import os
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++
++import data_paths
++import session_watch
++
++
++def test_tool_token_survives_a_second_start_without_posix_file_apis(tmp_path, monkeypatch):
++    """Windows has no O_NOFOLLOW / getuid / fchmod. The token file's second read used to raise
++    AttributeError there, so JARVIS crashed the second time it started."""
++    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
++    for name in ("O_NOFOLLOW", "getuid", "fchmod"):
++        monkeypatch.delattr(os, name, raising=False)
++    first = data_paths.ensure_tool_token()
++    second = data_paths.ensure_tool_token()
++    assert first and first == second
++
++
++def test_tool_token_without_posix_apis_refuses_a_symlink(tmp_path, monkeypatch):
++    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
++    for name in ("O_NOFOLLOW", "getuid", "fchmod"):
++        monkeypatch.delattr(os, name, raising=False)
++    data_paths.ensure_tool_token()
++    path = data_paths.tool_token_path()
++    target = tmp_path / "elsewhere"
++    target.write_text("not-our-token")
++    path.unlink()
++    try:
++        path.symlink_to(target)
++    except (OSError, NotImplementedError):
++        return                                   # symlinks unavailable on this platform: nothing to check
++    try:
++        data_paths.ensure_tool_token()
++    except OSError:
++        return
++    raise AssertionError("a symlinked token file must be refused")
++
++
++def test_pid_alive_never_calls_os_kill_on_windows(monkeypatch):
++    """os.kill(pid, 0) terminates the process on Windows. It must never be the probe there."""
++    calls = []
++    monkeypatch.setattr(session_watch, "_IS_WINDOWS", True)
++    monkeypatch.setattr(session_watch, "_pid_alive_windows", lambda pid: calls.append(pid) or True)
++    monkeypatch.setattr(os, "kill", lambda *a, **k: (_ for _ in ()).throw(AssertionError("os.kill was called")))
++    assert session_watch.pid_alive(4242) is True
++    assert calls == [4242]
++
++
++def test_pid_alive_posix_behaviour_is_unchanged(monkeypatch):
++    monkeypatch.setattr(session_watch, "_IS_WINDOWS", False)
++    assert session_watch.pid_alive(os.getpid()) is True
++    assert session_watch.pid_alive(0) is False
++    assert session_watch.pid_alive(-5) is False
++    assert session_watch.pid_alive("abc") is False
++    assert session_watch.pid_alive(2 ** 22 + 12345) is False
 diff --git a/tts.py b/tts.py
 index 722c001..951cb26 100644
 --- a/tts.py

@@ -65,7 +65,12 @@ if curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
 else
   nohup python server.py --host 127.0.0.1 > logs/server.log 2>&1 &
   (cd frontend && nohup npm run dev > ../logs/frontend.log 2>&1 &)
-  for _ in $(seq 1 40); do curl -fs http://127.0.0.1:5173/ >/dev/null 2>&1 && break; sleep 1; done
+  for _ in $(seq 1 60); do curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1 && break; sleep 1; done
+  if ! curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
+    echo "ERROR: el servidor de JARVIS no arrancó. Últimas líneas de logs/server.log:" >&2
+    tail -n 40 logs/server.log >&2
+    exit 1
+  fi
 fi
 echo "JARVIS: http://localhost:5173   (Ctrl+K = todas tus conversaciones)"
 { start http://localhost:5173 || open http://localhost:5173 || xdg-open http://localhost:5173; } >/dev/null 2>&1 || true
@@ -84,9 +89,25 @@ y con Ctrl+K ve todas sus conversaciones de Claude Code, actualizadas en directo
 CMD
 
 echo
-echo "JARVIS listo. Arrancando en http://localhost:5173  (Ctrl+C para parar)"
-echo "Desde Claude Code también puedes escribir /jarvis para iniciarlo."
-python server.py --host 127.0.0.1 &
+echo "Arrancando el servidor de JARVIS..."
+mkdir -p logs
+python server.py --host 127.0.0.1 > logs/server.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+for _ in $(seq 1 60); do
+  curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1 && break
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
+  sleep 1
+done
+if ! curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
+  echo >&2
+  echo "ERROR: el servidor de JARVIS no arrancó. Estas son sus últimas líneas (envíaselas a Claude):" >&2
+  echo "-----------------------------------------------------------------" >&2
+  tail -n 40 logs/server.log >&2
+  echo "-----------------------------------------------------------------" >&2
+  echo "Registro completo: $DIR/logs/server.log" >&2
+  exit 1
+fi
+echo "JARVIS listo. Abre http://localhost:5173 en Chrome  (Ctrl+C para parar)"
+echo "Desde Claude Code también puedes escribir /jarvis para iniciarlo."
 cd frontend && npm run dev
