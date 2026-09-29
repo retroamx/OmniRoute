@@ -1,9 +1,9 @@
 diff --git a/agents.py b/agents.py
 new file mode 100644
-index 0000000..47693ca
+index 0000000..3e5c0a9
 --- /dev/null
 +++ b/agents.py
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,193 @@
 +"""
 +agents.py — which coding agents this machine can use, and a runner for Codex.
 +
@@ -159,7 +159,8 @@ index 0000000..47693ca
 +        return
 +
 +    async with _run_lock:
-+        argv = [find_cli("codex") or "codex", "exec", "--skip-git-repo-check", "--sandbox", _sandbox(),
++        import claude_env
++        argv = [*claude_env.resolve_cli(find_cli("codex") or "codex"), "exec", "--skip-git-repo-check", "--sandbox", _sandbox(),
 +                "--json", "-C", str(workdir), "-"]
 +        try:
 +            proc = await asyncio.create_subprocess_exec(
@@ -196,12 +197,71 @@ index 0000000..47693ca
 +        if proc.returncode not in (0, None) and not got_text:
 +            yield {"type": "error", "text": "Codex terminó con un error. Comprueba tu sesión (codex login) y tu conexión."}
 +        yield {"type": "done"}
+diff --git a/brain.py b/brain.py
+index d0ec5ff..361d353 100644
+--- a/brain.py
++++ b/brain.py
+@@ -404,6 +404,9 @@ class Brain:
+         self._ready = False
+         self._failed = False
+         self._failure_reason: Optional[str] = None
++        # The last thing that went wrong, in words the UI can show (the OS error, or the tail of stderr).
++        self.last_error: Optional[str] = None
++        self._stderr_tail: list[str] = []
+         self._stopping = False
+         self._restart_times: list[float] = []
+         self._restart_task: Optional[asyncio.Task] = None
+@@ -742,7 +745,7 @@ class Brain:
+ 
+     def command(self) -> list[str]:
+         c = self.config
+-        cmd = shlex.split(self._claude) + [
++        cmd = claude_env.resolve_cli(self._claude) + [
+             "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+             "--verbose", "--include-partial-messages",
+             "--model", c.model, "--effort", c.effort, "--name", "jarvis",
+@@ -818,6 +821,12 @@ class Brain:
+         except OSError as e:  # includes FileNotFoundError / PermissionError
+             self.generation -= 1
+             log.error(f"brain: cannot start {self._claude!r}: {e}")
++            if isinstance(e, FileNotFoundError):
++                self.last_error = ("No se encuentra Claude Code. Instálalo con "
++                                   "`npm install -g @anthropic-ai/claude-code`, ejecuta `claude` para iniciar sesión "
++                                   "y pulsa REINTENTAR.")
++            else:
++                self.last_error = f"No se pudo lanzar Claude Code: {e}"
+             self._proc = None
+             if rotating:
+                 return False      # the caller still has a brain that works
+@@ -1214,7 +1223,10 @@ class Brain:
+                     continue
+                 if not raw:
+                     return
+-                log.debug(f"brain stderr: {raw.decode(errors='replace').rstrip()}")
++                line = raw.decode(errors='replace').rstrip()
++                log.debug(f"brain stderr: {line}")
++                if line.strip():
++                    self._stderr_tail = (self._stderr_tail + [line[:300]])[-6:]
+         except Exception as e:
+             log.warning(f"brain: stderr reader stopped: {e}")
+ 
+@@ -1229,6 +1241,10 @@ class Brain:
+         if self._stopping:
+             return
+         log.error(f"brain: process exited with {code}")
++        tail = " | ".join(self._stderr_tail[-3:])
++        self.last_error = f"Claude Code se cerró (código {code})" + (f": {tail}" if tail else "")
++        if tail:
++            log.error(f"brain: last stderr: {tail}")
+         self._schedule_restart(f"exit {code}")
+ 
+     # ── restarts ───────────────────────────────────────────────────────
 diff --git a/chats_view.py b/chats_view.py
 new file mode 100644
-index 0000000..a363a29
+index 0000000..1412652
 --- /dev/null
 +++ b/chats_view.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,190 @@
 +"""
 +chats_view.py — read-only view over Claude Code's own conversation history.
 +
@@ -318,7 +378,19 @@ index 0000000..a363a29
 +    return row
 +
 +
-+def list_chats(query: str = "", limit: int = 200, root: Optional[Path] = None) -> list[dict[str, Any]]:
++def _is_under(cwd: str, parents: tuple[Path, ...]) -> bool:
++    if not cwd or not parents:
++        return False
++    try:
++        p = Path(cwd).resolve()
++    except (OSError, RuntimeError, ValueError):
++        return False
++    return any(p == q or q in p.parents for q in parents)
++
++
++def list_chats(query: str = "", limit: int = 200, root: Optional[Path] = None,
++               exclude_under: tuple[Path, ...] = ()) -> list[dict[str, Any]]:
++    """`exclude_under`: working directories whose conversations are not the user's (JARVIS's own brain)."""
 +    root = root or projects_root()
 +    if not root.is_dir():
 +        return []
@@ -331,7 +403,7 @@ index 0000000..a363a29
 +            row = _summarise(p)
 +        except OSError:
 +            continue
-+        if row["messages"] == 0:
++        if row["messages"] == 0 or _is_under(row["cwd"], exclude_under):
 +            continue
 +        if q and q not in f'{row["title"]} {row["project"]} {row["last_prompt"]}'.lower():
 +            continue
@@ -380,6 +452,75 @@ index 0000000..a363a29
 +        "total": total,
 +        "messages": out[max(after, 0):][:limit],
 +    }
+diff --git a/claude_env.py b/claude_env.py
+index 2ac8086..1d970dd 100644
+--- a/claude_env.py
++++ b/claude_env.py
+@@ -21,6 +21,10 @@ updated is the one nobody notices.
+ from __future__ import annotations
+ 
+ import os
++import re
++import shlex
++import shutil
++from pathlib import Path
+ 
+ # Every ANTHROPIC_* variable, not just the key: the base URL and the model
+ # override redirect a child just as effectively as credentials do.
+@@ -56,3 +60,53 @@ def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
+     return {k: v for k, v in source.items()
+             if not k.startswith(SCRUBBED_ENV_PREFIXES)
+             and k not in SCRUBBED_ENV_KEYS}
++
++
++# ── launching a CLI on Windows ───────────────────────────────────────────────
++# `shutil.which("claude")` on Windows returns an npm shim such as
++# C:\Users\me\AppData\Roaming\npm\claude.CMD. Two things break on it:
++#   * `shlex.split()` treats every backslash as an escape, so the path came out
++#     as "C:Usersme..." and the brain never started at all;
++#   * a .cmd is run by cmd.exe, which re-parses the arguments: the brain's
++#     multi-line system prompt and its JSON --settings were cut or mangled.
++# So on Windows the shim is unwrapped to the program it points at (node + the
++# package's .js, or the package's own .exe) and that is launched directly.
++
++_SHIM_TARGET = re.compile(r'"%~?dp0%?\\?([^"%]+)"', re.IGNORECASE)
++
++
++def _unwrap_npm_shim(path: str) -> list[str] | None:
++    p = Path(path)
++    if not p.suffix and p.with_suffix(".cmd").exists():
++        p = p.with_suffix(".cmd")
++    if p.suffix.lower() not in (".cmd", ".bat"):
++        return None
++    try:
++        text = p.read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        return None
++    targets = [t for t in _SHIM_TARGET.findall(text) if not t.lower().endswith("node.exe")]
++    if not targets:
++        return None
++    target = (p.parent / targets[-1].replace("\\", "/")).resolve()
++    if not target.exists():
++        return None
++    if target.suffix.lower() in (".js", ".mjs", ".cjs"):
++        local_node = p.parent / "node.exe"
++        node = str(local_node) if local_node.exists() else (shutil.which("node") or "node")
++        return [node, str(target)]
++    if target.suffix.lower() == ".exe":
++        return [str(target)]
++    return None
++
++
++_IS_WINDOWS = os.name == "nt"
++
++
++def resolve_cli(cmd: str) -> list[str]:
++    """argv prefix that launches `cmd` (a name, a path, or on POSIX a small command line)."""
++    if not _IS_WINDOWS:
++        return shlex.split(cmd)
++    raw = (cmd or "").strip().strip('"')
++    found = shutil.which(raw) or raw
++    return _unwrap_npm_shim(found) or [found]
 diff --git a/data_paths.py b/data_paths.py
 index f20b175..4c1349a 100644
 --- a/data_paths.py
@@ -404,296 +545,196 @@ index f20b175..4c1349a 100644
      try:
          info = os.fstat(fd)
 diff --git a/frontend/index.html b/frontend/index.html
-index 9440bda..5c274c4 100644
+index 9440bda..0ab5c5c 100644
 --- a/frontend/index.html
 +++ b/frontend/index.html
-@@ -4,6 +4,7 @@
+@@ -4,6 +4,10 @@
      <meta charset="UTF-8" />
      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
      <title>JARVIS</title>
 +    <link rel="icon" href="data:," />
++    <link rel="preconnect" href="https://fonts.googleapis.com" />
++    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
++    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@300;400;600&family=Inter:wght@400;500;600&display=swap" />
      <link rel="stylesheet" href="/src/style.css" />
    </head>
    <body>
 diff --git a/frontend/src/chat.css b/frontend/src/chat.css
 new file mode 100644
-index 0000000..cfdfb22
+index 0000000..a89f704
 --- /dev/null
 +++ b/frontend/src/chat.css
-@@ -0,0 +1,251 @@
-+/* Chat panel — glass surface over the orb, in the existing cyan-on-black palette. */
+@@ -0,0 +1,135 @@
++/* ════════════════════════════════════════════════════════════════════════════
++   Chat panel — a transmission console on the right. Accent tokens come from hud.css.
++   ════════════════════════════════════════════════════════════════════════════ */
 +
-+:root {
-+  --chat-w: 440px;
-+  --chat-accent: #38bdf8;
-+  --chat-accent-soft: rgba(56, 189, 248, 0.14);
-+  --chat-line: rgba(56, 189, 248, 0.16);
-+  --chat-text: #e6f3ff;
-+  --chat-dim: rgba(190, 220, 245, 0.55);
-+}
-+
-+#btn-chat.active {
-+  background: rgba(56, 189, 248, 0.16);
-+  color: rgba(56, 189, 248, 0.95);
-+  border-color: rgba(56, 189, 248, 0.4);
-+}
-+
-+/* Slide the panel in and push the controls clear of it. */
 +.chat {
-+  position: fixed;
-+  top: 0;
-+  right: 0;
-+  bottom: 0;
-+  width: min(var(--chat-w), 100vw);
-+  display: flex;
-+  flex-direction: column;
-+  background: linear-gradient(180deg, rgba(8, 13, 22, 0.86), rgba(5, 8, 14, 0.92));
-+  -webkit-backdrop-filter: blur(22px) saturate(140%);
-+  backdrop-filter: blur(22px) saturate(140%);
-+  border-left: 1px solid var(--chat-line);
-+  box-shadow: -24px 0 60px rgba(0, 0, 0, 0.55);
-+  transform: translateX(102%);
-+  transition: transform 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
-+  z-index: 30;
-+  color: var(--chat-text);
++  position: fixed; top: 0; right: 0; bottom: 0; width: min(var(--chat-w, 460px), 100vw); z-index: 30;
++  display: flex; flex-direction: column; color: var(--text);
++  background:
++    linear-gradient(180deg, hsl(var(--acc-h) 80% 50% / 0.06), transparent 30%),
++    linear-gradient(180deg, rgba(4, 9, 16, 0.9), rgba(2, 5, 10, 0.96));
++  -webkit-backdrop-filter: blur(24px) saturate(140%); backdrop-filter: blur(24px) saturate(140%);
++  border-left: 1px solid var(--acc-line);
++  box-shadow: -30px 0 70px rgba(0, 0, 0, 0.6), inset 1px 0 0 hsl(var(--acc-h) 90% 70% / 0.08);
++  transform: translateX(102%); transition: transform 0.4s var(--ease), border-color 0.5s;
 +}
-+body.chat-open .chat { transform: translateX(0); }
-+body.chat-open #controls { right: calc(min(var(--chat-w), 100vw) + 16px); }
-+body.chat-open #menu-dropdown { right: calc(min(var(--chat-w), 100vw) + 16px); }
-+#controls, #menu-dropdown { transition: right 0.32s cubic-bezier(0.22, 0.8, 0.24, 1); }
-+@media (max-width: 720px) {
-+  body.chat-open #controls, body.chat-open #menu-dropdown { right: 16px; display: none; }
++body.chat-open .chat { transform: none; }
++/* A thin glowing edge that runs down the panel's left side. */
++.chat::before {
++  content: ""; position: absolute; left: -1px; top: 0; width: 1px; height: 140px;
++  background: linear-gradient(transparent, var(--acc), transparent); box-shadow: 0 0 10px var(--acc);
++  animation: chat-scan 6s linear infinite;
 +}
 +
-+/* ── header ─────────────────────────────────────────────────────────────── */
-+.chat-head {
-+  display: flex;
-+  align-items: center;
-+  gap: 12px;
-+  padding: 16px 18px;
-+  border-bottom: 1px solid var(--chat-line);
-+}
-+.chat-avatar {
-+  width: 36px;
-+  height: 36px;
-+  border-radius: 50%;
-+  display: grid;
-+  place-items: center;
-+  font-weight: 600;
-+  letter-spacing: 0.5px;
-+  color: #04121c;
-+  background: radial-gradient(circle at 30% 25%, #9be4ff, #1592cf 70%);
-+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.45);
-+}
++/* ── header ───────────────────────────────────────────────────────────────── */
++.chat-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px 14px; border-bottom: 1px solid var(--hair); }
++.chat-emblem { position: relative; width: 38px; height: 38px; flex: none; display: grid; place-items: center; }
++.chat-emblem-core { width: 14px; height: 14px; transform: rotate(45deg); background: var(--acc); box-shadow: 0 0 16px var(--acc), 0 0 4px #fff inset; }
++.chat-emblem-ring { position: absolute; inset: 0; border: 1px solid var(--acc-line); border-top-color: var(--acc); border-radius: 50%; animation: hud-spin 3.5s linear infinite; }
 +.chat-titles { flex: 1; min-width: 0; }
-+.chat-title { font-size: 15px; font-weight: 600; letter-spacing: 2.5px; }
-+.chat-sub { font-size: 11.5px; color: var(--chat-dim); margin-top: 2px; }
-+
-+.chat-pill {
-+  display: flex;
-+  align-items: center;
-+  gap: 7px;
-+  font-size: 11px;
-+  letter-spacing: 0.4px;
-+  color: var(--chat-dim);
-+  padding: 5px 10px;
-+  border: 1px solid var(--chat-line);
-+  border-radius: 999px;
-+  background: rgba(56, 189, 248, 0.06);
-+  white-space: nowrap;
-+}
-+.chat-pill-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
-+.chat-pill[data-state="listening"] .chat-pill-dot { background: #34d399; box-shadow: 0 0 8px #34d399; }
-+.chat-pill[data-state="thinking"] .chat-pill-dot,
-+.chat-pill[data-state="compacting"] .chat-pill-dot { background: #fbbf24; animation: chat-pulse 1s infinite; }
-+.chat-pill[data-state="speaking"] .chat-pill-dot { background: var(--chat-accent); box-shadow: 0 0 8px var(--chat-accent); animation: chat-pulse 0.8s infinite; }
-+
-+.chat-icon-btn {
-+  border: 1px solid var(--chat-line);
-+  background: rgba(56, 189, 248, 0.05);
-+  color: var(--chat-dim);
-+  border-radius: 8px;
-+  min-width: 32px;
-+  height: 32px;
-+  padding: 0 10px;
-+  font: inherit;
-+  font-size: 12px;
-+  cursor: pointer;
-+  transition: all 0.15s;
-+}
-+.chat-icon-btn:hover { color: var(--chat-text); border-color: rgba(56, 189, 248, 0.45); background: var(--chat-accent-soft); }
++.chat-title { font-family: var(--f-ui); font-size: 17px; font-weight: 700; letter-spacing: 5px; }
++.chat-sub { font-family: var(--f-mono); font-size: 9.5px; letter-spacing: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--acc); opacity: 0.85; margin-top: 1px; }
++.chat-pill { display: flex; align-items: center; gap: 7px; padding: 5px 9px; border: 1px solid var(--hair); font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spacing: 2px; color: var(--dim); white-space: nowrap; }
++.chat-pill-dot { width: 6px; height: 6px; transform: rotate(45deg); background: #56657a; }
++.chat-pill[data-state="listening"] .chat-pill-dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
++.chat-pill[data-state="thinking"] .chat-pill-dot, .chat-pill[data-state="compacting"] .chat-pill-dot { background: var(--warn); animation: hud-blink 0.8s infinite; }
++.chat-pill[data-state="speaking"] .chat-pill-dot { background: var(--acc); box-shadow: 0 0 8px var(--acc); animation: hud-blink 0.6s infinite; }
++.chat-btn { display: inline-flex; align-items: center; gap: 6px; height: 30px; min-width: 30px; justify-content: center; padding: 0 8px; border: 1px solid var(--hair); background: transparent; color: var(--dim); font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spacing: 2px; cursor: pointer; transition: all 0.15s; }
++.chat-btn:hover { color: var(--acc); border-color: var(--acc); }
++.chat-stop { color: var(--warn); border-color: rgba(255, 194, 75, 0.45); }
 +.chat-stop[hidden] { display: none; }
 +
-+/* ── messages ───────────────────────────────────────────────────────────── */
-+.chat-list {
-+  flex: 1;
-+  overflow-y: auto;
-+  padding: 20px 18px 8px;
-+  display: flex;
-+  flex-direction: column;
-+  gap: 14px;
-+  scroll-behavior: smooth;
-+}
-+.chat-list::-webkit-scrollbar { width: 8px; }
-+.chat-list::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.18); border-radius: 8px; }
++/* ── core status ──────────────────────────────────────────────────────────── */
++.chat-core { display: flex; align-items: center; gap: 9px; padding: 7px 18px; font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spacing: 2.5px; color: var(--dim); border-bottom: 1px solid var(--hair); }
++.chat-core-dot { width: 6px; height: 6px; transform: rotate(45deg); background: #56657a; }
++.chat-core[data-state="ready"] .chat-core-dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
++.chat-core[data-state="starting"] .chat-core-dot, .chat-core[data-state="disconnected"] .chat-core-dot { background: var(--warn); animation: hud-blink 1s infinite; }
++.chat-core[data-state="failed"], .chat-core[data-state="offline"] { color: #ffb3bf; background: rgba(255, 90, 112, 0.06); }
++.chat-core[data-state="failed"] .chat-core-dot, .chat-core[data-state="offline"] .chat-core-dot { background: var(--bad); box-shadow: 0 0 8px var(--bad); animation: hud-blink 0.8s infinite; }
++.chat-core-text { flex: 1; }
++.chat-core-retry { font: inherit; letter-spacing: 2px; padding: 3px 9px; cursor: pointer; color: var(--text); background: rgba(255, 90, 112, 0.15); border: 1px solid rgba(255, 90, 112, 0.5); }
++.chat-core-retry:hover { background: rgba(255, 90, 112, 0.3); }
++.chat-core-retry[hidden] { display: none; }
++.chat-core-detail { padding: 8px 18px 10px; font-family: var(--f-mono); font-size: 11px; line-height: 1.5; color: #ffc9d1; background: rgba(255, 90, 112, 0.06); border-bottom: 1px solid rgba(255, 90, 112, 0.2); overflow-wrap: anywhere; }
++.chat-core-detail[hidden] { display: none; }
++body[data-agent="codex"] .chat-core, body[data-agent="codex"] .chat-core-detail { display: none; }
 +
-+.msg { display: flex; animation: chat-in 0.22s ease-out; }
++/* ── codex banner ─────────────────────────────────────────────────────────── */
++.chat-banner { display: none; align-items: center; gap: 10px; padding: 8px 18px; border-bottom: 1px solid var(--acc-line); background: linear-gradient(90deg, hsl(156 90% 45% / 0.16), transparent 70%); }
++body[data-agent="codex"] .chat-banner { display: flex; }
++.chat-banner-tag { font-family: var(--f-ui); font-size: 11px; font-weight: 700; letter-spacing: 3px; color: #04140d; background: var(--acc); padding: 2px 8px; box-shadow: 0 0 12px var(--acc-glow); }
++.chat-banner-text { font-family: var(--f-mono); font-size: 10px; color: var(--dim); }
++
++/* ── quick actions ────────────────────────────────────────────────────────── */
++.chat-skills { padding: 12px 18px; border-bottom: 1px solid var(--hair); }
++.chat-skills-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
++.chat-skill {
++  display: flex; align-items: center; gap: 10px; text-align: left; padding: 9px 10px; cursor: pointer; font: inherit; color: var(--text);
++  background: rgba(255, 255, 255, 0.025); border: 1px solid var(--hair); border-left: 2px solid var(--acc-line);
++  transition: border-color 0.15s, background 0.15s, transform 0.15s var(--ease);
++}
++.chat-skill:hover { border-color: var(--acc-line); border-left-color: var(--acc); background: var(--acc-soft); transform: translateX(2px); }
++.chat-skill-icon { color: var(--acc); display: grid; place-items: center; }
++.chat-skill-txt { display: flex; flex-direction: column; min-width: 0; }
++.chat-skill-title { font-family: var(--f-ui); font-size: 13.5px; font-weight: 700; letter-spacing: 0.5px; }
++.chat-skill-hint { font-size: 10.5px; color: var(--faint); }
++
++/* ── messages ─────────────────────────────────────────────────────────────── */
++.chat-list { flex: 1; overflow-y: auto; padding: 18px 18px 8px; display: flex; flex-direction: column; gap: 14px; scroll-behavior: smooth; }
++.chat-list::-webkit-scrollbar { width: 6px; }
++.chat-list::-webkit-scrollbar-thumb { background: var(--acc-line); }
++.msg { display: flex; animation: chat-in 0.28s var(--ease); }
 +.msg-user { justify-content: flex-end; }
-+.bubble {
-+  max-width: 88%;
-+  padding: 11px 14px;
-+  border-radius: 16px;
-+  font-size: 14px;
-+  line-height: 1.55;
-+  word-wrap: break-word;
-+  overflow-wrap: anywhere;
-+}
-+.msg-bot .bubble {
-+  background: rgba(255, 255, 255, 0.045);
-+  border: 1px solid rgba(255, 255, 255, 0.07);
-+  border-bottom-left-radius: 5px;
-+}
-+.msg-user .bubble {
-+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.26), rgba(14, 116, 200, 0.22));
-+  border: 1px solid rgba(56, 189, 248, 0.35);
-+  border-bottom-right-radius: 5px;
-+}
-+.bubble code {
-+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-+  font-size: 12.5px;
-+  background: rgba(0, 0, 0, 0.35);
-+  padding: 1px 5px;
-+  border-radius: 4px;
-+}
-+.bubble pre {
-+  margin: 8px 0 2px;
-+  padding: 10px 12px;
-+  background: rgba(0, 0, 0, 0.45);
-+  border: 1px solid var(--chat-line);
-+  border-radius: 8px;
-+  overflow-x: auto;
-+}
-+.bubble pre code { background: none; padding: 0; }
-+.stamp { margin-top: 6px; font-size: 10.5px; color: var(--chat-dim); text-align: right; }
++.bubble { position: relative; max-width: 90%; padding: 9px 13px 11px; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
++.msg-meta { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 3px; font-family: var(--f-mono); font-size: 9.5px; letter-spacing: 1.2px; }
++.msg-who { color: var(--acc); font-weight: 600; }
++.msg-time { color: var(--faint); }
++.msg-bot .bubble { background: linear-gradient(90deg, var(--acc-soft), rgba(255, 255, 255, 0.02) 40%); border-left: 2px solid var(--acc); box-shadow: inset 0 0 0 1px var(--hair); }
++.msg-bot[data-agent="codex"] .bubble { border-left-color: hsl(156 90% 60%); background: linear-gradient(90deg, hsl(156 90% 55% / 0.12), rgba(255, 255, 255, 0.02) 40%); }
++.msg-bot[data-agent="codex"] .msg-who { color: hsl(156 90% 64%); }
++.msg-user .bubble { background: rgba(255, 255, 255, 0.045); border-right: 2px solid rgba(233, 245, 255, 0.55); box-shadow: inset 0 0 0 1px var(--hair); }
++.msg-user .msg-who { color: var(--dim); }
++.bubble code { font-family: var(--f-mono); font-size: 12.5px; color: var(--acc-strong); background: rgba(0, 0, 0, 0.45); padding: 1px 5px; }
++.bubble pre { margin: 8px 0 2px; padding: 10px 12px; background: rgba(0, 0, 0, 0.55); border: 1px solid var(--hair); border-left: 2px solid var(--acc-line); overflow-x: auto; }
++.bubble pre code { background: none; padding: 0; color: #d6ecff; }
++.bubble strong { color: #fff; }
 +
-+.typing { display: flex; gap: 5px; padding: 14px 16px; }
-+.typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--chat-accent); opacity: 0.35; animation: chat-bounce 1.2s infinite; }
-+.typing i:nth-child(2) { animation-delay: 0.15s; }
-+.typing i:nth-child(3) { animation-delay: 0.3s; }
++.msg-typing .bubble { display: flex; flex-direction: column; gap: 7px; min-width: 190px; padding: 11px 14px; }
++.typing-label { font-family: var(--f-ui); font-size: 11px; font-weight: 700; letter-spacing: 3px; color: var(--acc); }
++.typing-bar { position: relative; height: 2px; background: rgba(255, 255, 255, 0.06); overflow: hidden; }
++.typing-bar::after { content: ""; position: absolute; top: 0; bottom: 0; width: 35%; background: var(--acc); box-shadow: 0 0 10px var(--acc); animation: chat-load 1.1s var(--ease) infinite; }
 +
-+/* ── empty state ────────────────────────────────────────────────────────── */
-+.chat-empty { margin: auto 0; text-align: center; padding: 0 6px 28px; }
-+.chat-empty-title { font-size: 20px; font-weight: 600; letter-spacing: 0.3px; }
-+.chat-empty-sub { margin: 8px auto 20px; max-width: 320px; font-size: 13px; line-height: 1.55; color: var(--chat-dim); }
-+.chat-chips { display: flex; flex-direction: column; gap: 8px; }
-+.chat-chip {
-+  font: inherit;
-+  font-size: 13px;
-+  text-align: left;
-+  padding: 11px 14px;
-+  color: var(--chat-text);
-+  background: rgba(56, 189, 248, 0.06);
-+  border: 1px solid var(--chat-line);
-+  border-radius: 12px;
-+  cursor: pointer;
-+  transition: all 0.15s;
-+}
-+.chat-chip:hover { background: var(--chat-accent-soft); border-color: rgba(56, 189, 248, 0.45); transform: translateY(-1px); }
++.msg-note { align-self: center; max-width: 92%; text-align: center; font-family: var(--f-mono); font-size: 11px; line-height: 1.55; color: var(--dim); padding: 3px 10px; animation: chat-in 0.25s var(--ease); }
++.msg-note code { color: var(--text); background: rgba(0, 0, 0, 0.5); border: 1px solid var(--hair); padding: 3px 8px; display: inline-block; margin-top: 2px; }
++.msg-note.error { color: #ffb3bf; }
++.msg-divider { display: flex; align-items: center; gap: 10px; font-family: var(--f-ui); font-size: 10px; font-weight: 700; letter-spacing: 3px; color: var(--faint); }
++.msg-divider::before, .msg-divider::after { content: ""; flex: 1; height: 1px; background: var(--hair); }
 +
-+/* ── composer ───────────────────────────────────────────────────────────── */
++.chat-empty { margin: auto 0; text-align: center; padding: 0 10px 30px; }
++.chat-empty-glyph { width: 46px; height: 46px; margin: 0 auto 16px; border: 1px solid var(--acc-line); transform: rotate(45deg); box-shadow: 0 0 24px var(--acc-soft), inset 0 0 14px var(--acc-soft); position: relative; }
++.chat-empty-glyph::after { content: ""; position: absolute; inset: 14px; background: var(--acc); box-shadow: 0 0 14px var(--acc); }
++.chat-empty-title { font-family: var(--f-ui); font-size: 21px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; }
++.chat-empty-sub { margin: 8px auto 0; max-width: 320px; font-size: 13px; line-height: 1.6; color: var(--dim); }
++
++/* ── composer ─────────────────────────────────────────────────────────────── */
 +.chat-composer {
-+  display: flex;
-+  align-items: flex-end;
-+  gap: 10px;
-+  margin: 8px 16px 0;
-+  padding: 8px 8px 8px 14px;
-+  background: rgba(255, 255, 255, 0.05);
-+  border: 1px solid var(--chat-line);
-+  border-radius: 16px;
-+  transition: border-color 0.15s, box-shadow 0.15s;
++  display: flex; align-items: flex-end; gap: 8px; margin: 8px 16px 0; padding: 7px 7px 7px 12px;
++  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--acc-line); transition: border-color 0.2s, box-shadow 0.2s;
 +}
-+.chat-composer:focus-within { border-color: rgba(56, 189, 248, 0.55); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1); }
-+.chat-input {
-+  flex: 1;
-+  resize: none;
-+  border: 0;
-+  outline: 0;
-+  background: transparent;
-+  color: var(--chat-text);
-+  font: inherit;
-+  font-size: 14px;
-+  line-height: 1.5;
-+  padding: 7px 0;
-+  max-height: 160px;
-+}
-+.chat-input::placeholder { color: rgba(190, 220, 245, 0.35); }
++.chat-composer:focus-within { border-color: var(--acc); box-shadow: 0 0 0 3px var(--acc-soft), 0 0 26px var(--acc-soft); }
++.chat-prompt { font-family: var(--f-mono); font-size: 17px; line-height: 38px; color: var(--acc); text-shadow: 0 0 8px var(--acc-glow); }
++.chat-input { flex: 1; resize: none; border: 0; outline: 0; background: transparent; color: var(--text); font-family: var(--f-text); font-size: 14px; line-height: 1.5; padding: 8px 0; max-height: 160px; }
++.chat-input::placeholder { color: var(--faint); }
 +.chat-send {
-+  width: 38px;
-+  height: 38px;
-+  flex: none;
-+  border: 0;
-+  border-radius: 11px;
-+  display: grid;
-+  place-items: center;
-+  cursor: pointer;
-+  color: #04121c;
-+  background: linear-gradient(135deg, #7dd3fc, #0ea5e9);
-+  transition: transform 0.12s, filter 0.15s;
++  width: 40px; height: 40px; flex: none; border: 0; cursor: pointer; display: grid; place-items: center; color: #02070c;
++  background: var(--acc); box-shadow: 0 0 18px var(--acc-glow);
++  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
++  transition: filter 0.15s, transform 0.12s;
 +}
-+.chat-send:hover { filter: brightness(1.12); }
++.chat-send:hover { filter: brightness(1.15); }
 +.chat-send:active { transform: scale(0.94); }
-+.chat-hint { padding: 8px 18px 14px; font-size: 10.5px; color: rgba(190, 220, 245, 0.32); text-align: center; letter-spacing: 0.2px; }
-+
-+/* The orb's own labels would sit under the panel; nudge them into the free area. */
-+body.chat-open #status-text,
-+body.chat-open #jarvis-label { left: calc((100% - min(var(--chat-w), 100vw)) / 2); }
-+body.chat-open #hush { display: none; }
++.chat-foot { display: flex; justify-content: center; gap: 16px; padding: 8px 18px 14px; font-family: var(--f-mono); font-size: 9.5px; letter-spacing: 1px; color: var(--faint); }
 +
 +@keyframes chat-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-+@keyframes chat-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.35; } 30% { transform: translateY(-5px); opacity: 1; } }
-+@keyframes chat-pulse { 50% { opacity: 0.4; } }
-+
-+/* ── quick-access skills ────────────────────────────────────────────────── */
-+.chat-skills { padding: 14px 18px 4px; border-bottom: 1px solid var(--chat-line); }
-+.chat-skills-label { font-size: 10px; letter-spacing: 2.4px; color: var(--chat-dim); margin-bottom: 10px; }
-+.chat-skills-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding-bottom: 12px; }
-+.chat-skill {
-+  display: flex; flex-direction: column; gap: 3px; text-align: left; font: inherit; cursor: pointer;
-+  padding: 10px 12px; color: var(--chat-text);
-+  background: rgba(56, 189, 248, 0.05); border: 1px solid var(--chat-line); border-radius: 10px;
-+  transition: all 0.15s;
-+}
-+.chat-skill:hover { background: var(--chat-accent-soft); border-color: rgba(56, 189, 248, 0.5); transform: translateY(-1px); }
-+.chat-skill-title { font-size: 12.5px; font-weight: 600; }
-+.chat-skill-hint { font-size: 10.5px; color: var(--chat-dim); }
-+
-+.msg-note { align-self: center; max-width: 92%; text-align: center; font-size: 11.5px; line-height: 1.55; color: var(--chat-dim); padding: 4px 10px; animation: chat-in 0.22s ease-out; }
-+.msg-note code { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; background: rgba(0, 0, 0, 0.4); padding: 2px 7px; border-radius: 5px; color: #e6f3ff; }
-+.msg-note.error { color: #fca5a5; }
-+body[data-agent="codex"] .chat-avatar { background: radial-gradient(circle at 30% 25%, #b9f6ca, #10a37f 70%); box-shadow: 0 0 18px rgba(16, 163, 127, 0.5); }
-+body[data-agent="codex"] { --chat-accent: #34d399; }
++@keyframes chat-load { 0% { left: -35%; } 100% { left: 100%; } }
++@keyframes chat-scan { 0% { top: -140px; } 100% { top: 100%; } }
 diff --git a/frontend/src/chat.ts b/frontend/src/chat.ts
 new file mode 100644
-index 0000000..814603e
+index 0000000..0925125
 --- /dev/null
 +++ b/frontend/src/chat.ts
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,520 @@
 +/**
-+ * Chat panel — type to JARVIS and read his replies as a conversation.
++ * Chat panel — type to JARVIS (Claude Code) or Codex and read the replies as a conversation.
 + *
-+ * It rides the same WebSocket as the microphone: a typed message is sent as a
-+ * final transcript, and his answer is rebuilt from the `audio` / `text` frames
-+ * (each carries the sentence chunk it voices). Nothing here talks to the
-+ * server on its own; main.ts feeds it frames and hands it a send callback.
++ * Voice-brain replies are rebuilt from the `audio` / `text` frames of the voice WebSocket (each
++ * carries the sentence it voices); Codex replies arrive whole through `botMessage`. The history
++ * is kept in this browser (localStorage) so a reload, or a restart of JARVIS, does not wipe it,
++ * and it travels with the conversation export.
++ *
++ * Everything model-written is rendered with DOM text nodes only — never innerHTML.
 + */
 +
 +import "./chat.css";
 +
 +export type ChatState = "idle" | "listening" | "thinking" | "speaking" | "compacting";
++export type CoreState = "ready" | "starting" | "failed" | "offline" | "disconnected";
 +
 +export interface ChatOptions {
 +  onSend(text: string): void;
 +  onStop(): void;
++  onRetryCore(): void;
++}
++
++export interface StoredMsg {
++  role: "user" | "bot" | "note";
++  text: string;
++  agent: string;
++  t: number;
++  kind?: "info" | "error";
++  voice?: boolean;
 +}
 +
 +export interface Chat {
@@ -701,54 +742,64 @@ index 0000000..814603e
 +  handleMessage(msg: Record<string, unknown>): void;
 +  setState(state: ChatState): void;
 +  toggle(force?: boolean): void;
-+  /** Send a message as if typed, opening the panel. */
 +  ask(text: string): void;
-+  /** Which agent is answering: changes the header label and accent. */
 +  setAgent(id: string, name: string): void;
-+  /** A complete reply from an agent that is not the voice brain (Codex). */
 +  botMessage(text: string): void;
-+  /** A small centred line: progress, tool use, setup instructions, errors. */
 +  botNote(text: string, kind?: "info" | "error"): void;
 +  setTyping(on: boolean): void;
++  setCore(state: CoreState, detail?: string | null): void;
++  history(): StoredMsg[];
++  mergeHistory(items: StoredMsg[]): number;
 +}
 +
-+const SKILLS: { title: string; hint: string; prompt: string }[] = [
-+  { title: "Planear el día", hint: "prioridades y orden", prompt: "Ayúdame a planear mi día: pregúntame lo que necesites y propón un orden de prioridades." },
-+  { title: "Mis sesiones", hint: "qué espera respuesta", prompt: "¿Qué sesiones de Claude Code tengo abiertas y cuáles esperan algo de mí?" },
-+  { title: "Investigación", hint: "buscar y resumir", prompt: "Quiero investigar un tema a fondo. Pregúntame cuál y prepara un resumen con fuentes." },
-+  { title: "Nuevo proyecto", hint: "diseñar y construir", prompt: "Quiero empezar un proyecto nuevo. Ayúdame a diseñarlo paso a paso, con una pregunta cada vez." },
-+];
++const HISTORY_KEY = "jarvis.chat.history.v1";
++const HISTORY_MAX = 300;
 +
-+const STATE_LABEL: Record<ChatState, string> = {
-+  idle: "en espera",
-+  listening: "escuchando",
-+  thinking: "pensando",
-+  speaking: "hablando",
-+  compacting: "reorganizando memoria",
++const SKILLS: Record<string, { title: string; hint: string; prompt: string; icon: string }[]> = {
++  claude: [
++    { title: "Planear el día", hint: "prioridades", icon: "M4 7h16M4 12h10M4 17h7", prompt: "Ayúdame a planear mi día: pregúntame lo que necesites y propón un orden de prioridades." },
++    { title: "Mis sesiones", hint: "qué me espera", icon: "M4 5h16v10H4zM8 19h8", prompt: "¿Qué sesiones de Claude Code tengo abiertas y cuáles esperan algo de mí?" },
++    { title: "Investigar", hint: "buscar y resumir", icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM21 21l-5-5", prompt: "Quiero investigar un tema a fondo. Pregúntame cuál y prepara un resumen con fuentes." },
++    { title: "Nuevo proyecto", hint: "diseñar y construir", icon: "M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5", prompt: "Quiero empezar un proyecto nuevo. Ayúdame a diseñarlo paso a paso, con una pregunta cada vez." },
++  ],
++  codex: [
++    { title: "Explicar código", hint: "qué hace y por qué", icon: "M8 7l-5 5 5 5M16 7l5 5-5 5", prompt: "Explícame el código de la carpeta actual: estructura, piezas clave y cómo encajan." },
++    { title: "Buscar errores", hint: "revisión rápida", icon: "M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z", prompt: "Revisa el código de la carpeta actual y dime los fallos más probables, ordenados por gravedad." },
++    { title: "Escribir tests", hint: "qué falta probar", icon: "M9 12l2 2 4-4M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z", prompt: "¿Qué partes del código de la carpeta actual necesitan tests? Propón los más importantes." },
++    { title: "Resumen del repo", hint: "en 5 líneas", icon: "M4 6h16M4 10h16M4 14h10M4 18h6", prompt: "Resume en 5 líneas qué es el proyecto de la carpeta actual y cómo se ejecuta." },
++  ],
 +};
 +
-+export function el<K extends keyof HTMLElementTagNameMap>(
-+  tag: K,
-+  cls?: string,
-+  text?: string
-+): HTMLElementTagNameMap[K] {
++const STATE_LABEL: Record<ChatState, string> = {
++  idle: "EN ESPERA",
++  listening: "ESCUCHANDO",
++  thinking: "PROCESANDO",
++  speaking: "HABLANDO",
++  compacting: "REORGANIZANDO",
++};
++
++const CORE_LABEL: Record<CoreState, string> = {
++  ready: "NÚCLEO EN LÍNEA",
++  starting: "NÚCLEO INICIANDO",
++  failed: "NÚCLEO CAÍDO",
++  offline: "SERVIDOR SIN RESPUESTA",
++  disconnected: "RECONECTANDO",
++};
++
++export function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
 +  const node = document.createElement(tag);
 +  if (cls) node.className = cls;
 +  if (text !== undefined) node.textContent = text;
 +  return node;
 +}
 +
-+/**
-+ * Render a tiny markdown subset (```blocks```, `code`, **bold**, line breaks)
-+ * with DOM nodes only — model output never reaches innerHTML.
-+ */
++/** A tiny markdown subset (```blocks```, `code`, **bold**, line breaks) rendered with DOM nodes only. */
 +export function renderRich(target: HTMLElement, raw: string): void {
 +  target.replaceChildren();
-+  const parts = raw.split(/```/);
-+  parts.forEach((part, i) => {
++  raw.split(/```/).forEach((part, i) => {
 +    if (i % 2 === 1) {
 +      const pre = el("pre");
-+      pre.append(el("code", "", part.trim()));
++      pre.append(el("code", "", part.replace(/^[a-z0-9_-]*\n/i, "").trim()));
 +      target.append(pre);
 +      return;
 +    }
@@ -764,23 +815,41 @@ index 0000000..814603e
 +  });
 +}
 +
-+function svgIcon(path: string, width: number): SVGSVGElement {
++export function svgIcon(path: string, width = 1.6, size = 18): SVGSVGElement {
 +  const ns = "http://www.w3.org/2000/svg";
 +  const svg = document.createElementNS(ns, "svg");
-+  svg.setAttribute("width", "18");
-+  svg.setAttribute("height", "18");
++  svg.setAttribute("width", String(size));
++  svg.setAttribute("height", String(size));
 +  svg.setAttribute("viewBox", "0 0 24 24");
 +  svg.setAttribute("fill", "none");
 +  svg.setAttribute("stroke", "currentColor");
 +  svg.setAttribute("stroke-width", String(width));
++  svg.setAttribute("stroke-linecap", "round");
++  svg.setAttribute("stroke-linejoin", "round");
 +  const p = document.createElementNS(ns, "path");
 +  p.setAttribute("d", path);
 +  svg.append(p);
 +  return svg;
 +}
 +
-+function clock(): string {
-+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
++function hhmm(t = Date.now()): string {
++  return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
++}
++
++function loadHistory(): StoredMsg[] {
++  try {
++    const raw = localStorage.getItem(HISTORY_KEY);
++    const parsed = raw ? JSON.parse(raw) : [];
++    return Array.isArray(parsed) ? parsed.filter(isStoredMsg).slice(-HISTORY_MAX) : [];
++  } catch {
++    return [];
++  }
++}
++
++function isStoredMsg(m: unknown): m is StoredMsg {
++  const o = m as StoredMsg;
++  return !!o && typeof o === "object" && (o.role === "user" || o.role === "bot" || o.role === "note")
++    && typeof o.text === "string" && typeof o.t === "number" && typeof o.agent === "string";
 +}
 +
 +export function createChat(opts: ChatOptions): Chat {
@@ -790,64 +859,77 @@ index 0000000..814603e
 +
 +  // ── header ────────────────────────────────────────────────────────────────
 +  const header = el("header", "chat-head");
-+  const avatar = el("div", "chat-avatar", "J");
++  const emblem = el("div", "chat-emblem");
++  emblem.append(el("span", "chat-emblem-core"), el("span", "chat-emblem-ring"));
 +  const titles = el("div", "chat-titles");
-+  const subEl = el("div", "chat-sub", "impulsado por Claude Code");
-+  titles.append(el("div", "chat-title", "JARVIS"), subEl);
++  const nameEl = el("div", "chat-title", "JARVIS");
++  const subEl = el("div", "chat-sub", "CANAL · CLAUDE CODE");
++  titles.append(nameEl, subEl);
 +  const pill = el("div", "chat-pill");
-+  const pillDot = el("span", "chat-pill-dot");
-+  const pillText = el("span", "chat-pill-text", STATE_LABEL.idle);
-+  pill.append(pillDot, pillText);
-+  const stopBtn = el("button", "chat-icon-btn chat-stop", "Detener");
++  pill.append(el("span", "chat-pill-dot"), el("span", "chat-pill-text", STATE_LABEL.idle));
++  const pillText = pill.lastChild as HTMLElement;
++  const stopBtn = el("button", "chat-btn chat-stop");
 +  stopBtn.type = "button";
 +  stopBtn.hidden = true;
-+  stopBtn.title = "Dejar de hablar (Esc)";
-+  const closeBtn = el("button", "chat-icon-btn", "✕");
++  stopBtn.title = "Silenciar a JARVIS (Esc)";
++  stopBtn.append(svgIcon("M6 6h12v12H6z", 1.8, 14), el("span", "", "DETENER"));
++  const closeBtn = el("button", "chat-btn chat-close");
 +  closeBtn.type = "button";
-+  closeBtn.title = "Cerrar chat (Ctrl+/)";
-+  header.append(avatar, titles, pill, stopBtn, closeBtn);
++  closeBtn.title = "Cerrar panel (Ctrl+/)";
++  closeBtn.append(svgIcon("M6 6l12 12M18 6L6 18", 1.8, 14));
++  header.append(emblem, titles, pill, stopBtn, closeBtn);
++
++  // Core (voice brain) status strip: says why JARVIS is not answering instead of staying silent.
++  const core = el("div", "chat-core");
++  core.dataset.state = "starting";
++  const coreDot = el("span", "chat-core-dot");
++  const coreText = el("span", "chat-core-text", CORE_LABEL.starting);
++  const coreRetry = el("button", "chat-core-retry", "REINTENTAR");
++  coreRetry.type = "button";
++  coreRetry.hidden = true;
++  coreRetry.addEventListener("click", () => opts.onRetryCore());
++  core.append(coreDot, coreText, coreRetry);
++  const coreDetail = el("div", "chat-core-detail");
++  coreDetail.hidden = true;
++
++  // Codex mode banner.
++  const banner = el("div", "chat-banner");
++  banner.append(el("span", "chat-banner-tag", "MODO CODEX"), el("span", "chat-banner-text", "OpenAI · solo lectura · tu carpeta personal"));
++
++  // ── quick actions ─────────────────────────────────────────────────────────
++  const skills = el("section", "chat-skills");
++  const grid = el("div", "chat-skills-grid");
++  skills.append(grid);
 +
 +  // ── message list ──────────────────────────────────────────────────────────
 +  const list = el("div", "chat-list");
 +  list.setAttribute("role", "log");
 +  list.setAttribute("aria-live", "polite");
-+
 +  const empty = el("div", "chat-empty");
-+  empty.append(
-+    el("div", "chat-empty-title", "¿En qué te ayudo?"),
-+    el("div", "chat-empty-sub", "Escríbeme o háblame. Puedo planear, construir y vigilar tus sesiones de Claude Code.")
-+  );
++  const emptyTitle = el("div", "chat-empty-title", "Canal abierto");
++  const emptySub = el("div", "chat-empty-sub", "Escribe o habla. JARVIS planea, construye y vigila tus sesiones de Claude Code.");
++  empty.append(el("div", "chat-empty-glyph"), emptyTitle, emptySub);
 +  list.append(empty);
-+
-+  const skills = el("section", "chat-skills");
-+  skills.append(el("div", "chat-skills-label", "ACCESOS RÁPIDOS"));
-+  const grid = el("div", "chat-skills-grid");
-+  for (const sk of SKILLS) {
-+    const card = el("button", "chat-skill");
-+    card.type = "button";
-+    card.append(el("span", "chat-skill-title", sk.title), el("span", "chat-skill-hint", sk.hint));
-+    card.addEventListener("click", () => send(sk.prompt));
-+    grid.append(card);
-+  }
-+  skills.append(grid);
 +
 +  // ── composer ──────────────────────────────────────────────────────────────
 +  const composer = el("form", "chat-composer");
++  const prompt = el("span", "chat-prompt", "›");
 +  const input = el("textarea", "chat-input");
 +  input.rows = 1;
-+  input.placeholder = "Escribe un mensaje a JARVIS…";
++  input.placeholder = "Transmitir mensaje a JARVIS…";
 +  input.setAttribute("aria-label", "Mensaje");
 +  const sendBtn = el("button", "chat-send");
 +  sendBtn.type = "submit";
 +  sendBtn.title = "Enviar (Enter)";
-+  sendBtn.append(svgIcon("M12 19V5M5 12l7-7 7 7", 2));
-+  composer.append(input, sendBtn);
-+  const hint = el("div", "chat-hint", "Enter envía · Shift+Enter nueva línea · Esc detiene la voz");
++  sendBtn.append(svgIcon("M5 12h14M13 6l6 6-6 6", 2, 18));
++  composer.append(prompt, input, sendBtn);
++  const foot = el("div", "chat-foot");
++  foot.append(el("span", "", "ENTER envía"), el("span", "", "SHIFT+ENTER salto"), el("span", "", "ESC silencia"));
 +
-+  panel.append(header, skills, list, composer, hint);
++  panel.append(header, core, coreDetail, banner, skills, list, composer, foot);
 +  document.body.appendChild(panel);
 +
-+  // ── launcher button (joins the existing top-right controls) ───────────────
++  // Launcher in the top-right controls.
 +  const launcher = el("button");
 +  launcher.id = "btn-chat";
 +  launcher.type = "button";
@@ -857,12 +939,30 @@ index 0000000..814603e
 +
 +  // ── state ─────────────────────────────────────────────────────────────────
 +  let open = false;
-+  let state: ChatState = "idle";
++  let agent = "claude";
 +  let typingRow: HTMLElement | null = null;
 +  let replyBody: HTMLElement | null = null;
-+  let replyRaw = "";
++  let replyIdx = -1;             // index in `store` of the reply being assembled
 +  let replyUtt: number | null = null;
 +  const seen = new Set<string>();
++  const store: StoredMsg[] = loadHistory();
++  let saveTimer = 0;
++
++  function save() {
++    clearTimeout(saveTimer);
++    saveTimer = window.setTimeout(() => {
++      try {
++        localStorage.setItem(HISTORY_KEY, JSON.stringify(store.slice(-HISTORY_MAX)));
++      } catch { /* full or blocked: the panel still works */ }
++    }, 300);
++  }
++
++  function remember(m: StoredMsg): number {
++    store.push(m);
++    if (store.length > HISTORY_MAX * 1.2) store.splice(0, store.length - HISTORY_MAX);
++    save();
++    return store.length - 1;
++  }
 +
 +  function scrollDown() {
 +    list.scrollTop = list.scrollHeight;
@@ -872,11 +972,26 @@ index 0000000..814603e
 +    if (empty.parentElement) empty.remove();
 +  }
 +
++  function renderSkills() {
++    grid.replaceChildren();
++    for (const sk of SKILLS[agent] ?? SKILLS.claude) {
++      const card = el("button", "chat-skill");
++      card.type = "button";
++      const ic = el("span", "chat-skill-icon");
++      ic.append(svgIcon(sk.icon, 1.6, 16));
++      const txt = el("span", "chat-skill-txt");
++      txt.append(el("span", "chat-skill-title", sk.title), el("span", "chat-skill-hint", sk.hint));
++      card.append(ic, txt);
++      card.addEventListener("click", () => send(sk.prompt));
++      grid.append(card);
++    }
++  }
++
 +  function showTyping(on: boolean) {
 +    if (on && !typingRow) {
-+      typingRow = el("div", "msg msg-bot");
-+      const bubble = el("div", "bubble typing");
-+      bubble.append(el("i"), el("i"), el("i"));
++      typingRow = el("div", "msg msg-bot msg-typing");
++      const bubble = el("div", "bubble");
++      bubble.append(el("span", "typing-label", agent === "codex" ? "CODEX PROCESANDO" : "JARVIS PROCESANDO"), el("span", "typing-bar"));
 +      typingRow.append(bubble);
 +      dropEmpty();
 +      list.append(typingRow);
@@ -887,23 +1002,60 @@ index 0000000..814603e
 +    }
 +  }
 +
++  function tagFor(a: string): string {
++    return a === "codex" ? "CODEX" : "JARVIS";
++  }
++
++  function drawUser(text: string, t: number, voice: boolean): void {
++    const row = el("div", "msg msg-user");
++    const bubble = el("div", "bubble");
++    const meta = el("div", "msg-meta");
++    meta.append(el("span", "msg-who", voice ? "TÚ · VOZ" : "TÚ"), el("span", "msg-time", hhmm(t)));
++    const body = el("div", "bubble-body");
++    renderRich(body, text);
++    bubble.append(meta, body);
++    row.append(bubble);
++    list.append(row);
++  }
++
++  function drawBot(text: string, t: number, a: string): HTMLElement {
++    const row = el("div", "msg msg-bot");
++    row.dataset.agent = a;
++    const bubble = el("div", "bubble");
++    const meta = el("div", "msg-meta");
++    meta.append(el("span", "msg-who", tagFor(a)), el("span", "msg-time", hhmm(t)));
++    const body = el("div", "bubble-body");
++    renderRich(body, text);
++    bubble.append(meta, body);
++    row.append(bubble);
++    list.append(row);
++    return body;
++  }
++
++  function drawNote(text: string, kind: "info" | "error"): void {
++    const note = el("div", "msg-note" + (kind === "error" ? " error" : ""));
++    renderRich(note, text);
++    list.append(note);
++  }
++
 +  function appendBot(text: string, utt: number | null) {
 +    const clean = text.trim();
 +    if (!clean) return;
 +    showTyping(false);
 +    dropEmpty();
 +    if (!replyBody || (utt !== null && replyUtt !== null && utt !== replyUtt)) {
-+      const row = el("div", "msg msg-bot");
-+      const bubble = el("div", "bubble");
-+      replyBody = el("div", "bubble-body");
-+      bubble.append(replyBody, el("div", "stamp", clock()));
-+      row.append(bubble);
-+      list.append(row);
-+      replyRaw = "";
++      const t = Date.now();
++      replyBody = drawBot(clean, t, "claude");
++      replyIdx = remember({ role: "bot", text: clean, agent: "claude", t });
++    } else {
++      const m = store[replyIdx];
++      if (m) {
++        m.text += " " + clean;
++        renderRich(replyBody, m.text);
++        save();
++      }
 +    }
 +    replyUtt = utt;
-+    replyRaw += (replyRaw ? " " : "") + clean;
-+    renderRich(replyBody, replyRaw);
 +    scrollDown();
 +  }
 +
@@ -911,14 +1063,9 @@ index 0000000..814603e
 +    const clean = text.trim();
 +    if (!clean) return;
 +    dropEmpty();
-+    const row = el("div", "msg msg-user");
-+    const bubble = el("div", "bubble");
-+    const body = el("div", "bubble-body");
-+    renderRich(body, clean);
-+    bubble.append(body, el("div", "stamp", (viaVoice ? "🎙 " : "") + clock()));
-+    row.append(bubble);
-+    list.append(row);
-+    // The next reply starts a fresh bubble.
++    const t = Date.now();
++    drawUser(clean, t, viaVoice);
++    remember({ role: "user", text: clean, agent, t, voice: viaVoice || undefined });
 +    replyBody = null;
 +    replyUtt = null;
 +    scrollDown();
@@ -940,6 +1087,20 @@ index 0000000..814603e
 +    input.style.height = Math.min(input.scrollHeight, 160) + "px";
 +  }
 +
++  function renderStored() {
++    if (!store.length) return;
++    dropEmpty();
++    for (const m of store) {
++      if (m.role === "user") drawUser(m.text, m.t, !!m.voice);
++      else if (m.role === "bot") drawBot(m.text, m.t, m.agent);
++      else drawNote(m.text, m.kind ?? "info");
++    }
++    const div = el("div", "msg-divider");
++    div.append(el("span", "", `SESIÓN ANTERIOR · ${new Date(store[store.length - 1].t).toLocaleDateString()}`));
++    list.append(div);
++    requestAnimationFrame(scrollDown);
++  }
++
 +  composer.addEventListener("submit", (e) => {
 +    e.preventDefault();
 +    send(input.value);
@@ -950,11 +1111,9 @@ index 0000000..814603e
 +      e.preventDefault();
 +      send(input.value);
 +    }
-+    // Keep Esc for stopping his voice rather than closing anything.
 +    e.stopPropagation();
 +    if (e.key === "Escape") opts.onStop();
 +  });
-+
 +  stopBtn.addEventListener("click", () => opts.onStop());
 +  closeBtn.addEventListener("click", () => toggle(false));
 +  launcher.addEventListener("click", (e) => {
@@ -972,20 +1131,16 @@ index 0000000..814603e
 +    open = force ?? !open;
 +    document.body.classList.toggle("chat-open", open);
 +    launcher.classList.toggle("active", open);
-+    try {
-+      localStorage.setItem("jarvis.chat.open", open ? "1" : "0");
-+    } catch {
-+      /* storage can be blocked; the panel still works */
-+    }
++    try { localStorage.setItem("jarvis.chat.open", open ? "1" : "0"); } catch { /* ignore */ }
 +    window.dispatchEvent(new CustomEvent("jarvis:layout"));
 +    if (open) setTimeout(() => input.focus(), 250);
 +  }
 +
 +  function setState(next: ChatState) {
-+    state = next;
 +    pillText.textContent = STATE_LABEL[next];
 +    pill.dataset.state = next;
 +    stopBtn.hidden = next !== "speaking";
++    if (agent !== "claude") return;
 +    if (next === "thinking") showTyping(true);
 +    else if (next !== "compacting") showTyping(false);
 +  }
@@ -1003,16 +1158,6 @@ index 0000000..814603e
 +    }
 +  }
 +
-+  let remembered = false;
-+  try {
-+    remembered = localStorage.getItem("jarvis.chat.open") === "1";
-+  } catch {
-+    /* ignore */
-+  }
-+  // Open by default on wide screens, so the feature is discoverable.
-+  toggle(remembered || window.innerWidth >= 1000);
-+  void state;
-+
 +  function botMessage(text: string) {
 +    const clean = text.trim();
 +    if (!clean) return;
@@ -1020,103 +1165,138 @@ index 0000000..814603e
 +    dropEmpty();
 +    replyBody = null;
 +    replyUtt = null;
-+    const row = el("div", "msg msg-bot");
-+    const bubble = el("div", "bubble");
-+    const body = el("div", "bubble-body");
-+    renderRich(body, clean);
-+    bubble.append(body, el("div", "stamp", clock()));
-+    row.append(bubble);
-+    list.append(row);
++    const t = Date.now();
++    drawBot(clean, t, agent);
++    remember({ role: "bot", text: clean, agent, t });
 +    scrollDown();
 +  }
 +
 +  function botNote(text: string, kind: "info" | "error" = "info") {
 +    showTyping(false);
 +    dropEmpty();
-+    const note = el("div", "msg-note" + (kind === "error" ? " error" : ""));
-+    renderRich(note, text);
-+    list.append(note);
++    drawNote(text, kind);
++    remember({ role: "note", text, agent, t: Date.now(), kind });
 +    scrollDown();
 +  }
 +
++  function setCore(state: CoreState, detail?: string | null) {
++    core.dataset.state = state;
++    coreText.textContent = CORE_LABEL[state];
++    coreRetry.hidden = state !== "failed";
++    const d = (detail ?? "").trim();
++    coreDetail.hidden = !(d && (state === "failed" || state === "offline"));
++    coreDetail.textContent = d;
++    if (agent === "claude" && (state === "failed" || state === "offline" || state === "disconnected")) showTyping(false);
++  }
++
++  function setAgent(id: string, name: string) {
++    agent = id;
++    document.body.dataset.agent = id;
++    nameEl.textContent = id === "codex" ? "CODEX" : "JARVIS";
++    subEl.textContent = `CANAL · ${name.toUpperCase()}`;
++    input.placeholder = id === "codex" ? "Pide algo a Codex…" : "Transmitir mensaje a JARVIS…";
++    emptyTitle.textContent = id === "codex" ? "Codex listo" : "Canal abierto";
++    emptySub.textContent = id === "codex"
++      ? "Codex lee tu código y responde por escrito. Trabaja en modo solo lectura."
++      : "Escribe o habla. JARVIS planea, construye y vigila tus sesiones de Claude Code.";
++    renderSkills();
++  }
++
++  let remembered = false;
++  try { remembered = localStorage.getItem("jarvis.chat.open") === "1"; } catch { /* ignore */ }
++  renderSkills();
++  renderStored();
++  toggle(remembered || window.innerWidth >= 1000);
++
 +  return {
-+    botMessage, botNote, setTyping: showTyping,
-+    setAgent(id: string, name: string) {
-+      subEl.textContent = `impulsado por ${name}`;
-+      document.body.dataset.agent = id;
-+    },
++    botMessage, botNote, setTyping: showTyping, setCore, setAgent,
 +    addUser, handleMessage, setState, toggle,
 +    ask(text: string) { toggle(true); send(text); },
++    history: () => store.slice(-HISTORY_MAX),
++    mergeHistory(items: StoredMsg[]) {
++      const have = new Set(store.map((m) => `${m.t}:${m.role}:${m.text.slice(0, 40)}`));
++      const fresh = items.filter(isStoredMsg).filter((m) => !have.has(`${m.t}:${m.role}:${m.text.slice(0, 40)}`));
++      if (!fresh.length) return 0;
++      store.push(...fresh);
++      store.sort((a, b) => a.t - b.t);
++      save();
++      list.replaceChildren();
++      renderStored();
++      return fresh.length;
++    },
 +  };
 +}
 diff --git a/frontend/src/chats.css b/frontend/src/chats.css
 new file mode 100644
-index 0000000..6853bdd
+index 0000000..20ab50f
 --- /dev/null
 +++ b/frontend/src/chats.css
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,59 @@
++/* Conversations browser — same HUD language as the rest (tokens in hud.css). */
 +.cv {
-+  position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column;
-+  background: rgba(4, 7, 12, 0.94); -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px);
-+  color: #e6f3ff; opacity: 0; transform: scale(0.985); transition: opacity 0.2s, transform 0.2s;
++  position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column; color: var(--text);
++  background: radial-gradient(ellipse at 30% 0%, var(--acc-soft), transparent 55%), rgba(2, 5, 10, 0.96);
++  -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px);
++  opacity: 0; transform: scale(0.99); transition: opacity 0.25s, transform 0.25s var(--ease);
 +}
 +.cv[hidden] { display: none; }
 +.cv.show { opacity: 1; transform: none; }
 +
-+.cv-head { display: flex; align-items: center; gap: 18px; padding: 16px 24px; border-bottom: 1px solid rgba(56, 189, 248, 0.16); }
-+.cv-heading { min-width: 190px; }
-+.cv-title { font-size: 17px; font-weight: 600; letter-spacing: 1.5px; }
-+.cv-sub { font-size: 11.5px; color: rgba(190, 220, 245, 0.5); margin-top: 2px; }
-+.cv-live { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: rgba(190, 220, 245, 0.6); padding: 5px 11px; border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 999px; white-space: nowrap; }
-+.cv-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #34d399; box-shadow: 0 0 8px #34d399; animation: cv-pulse 1.6s infinite; }
-+.cv-live-dot.off { background: #ef4444; box-shadow: none; animation: none; }
-+.cv-search { flex: 1; max-width: 460px; margin-left: auto; font: inherit; font-size: 13.5px; color: inherit; padding: 9px 14px; border-radius: 10px; outline: 0; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(56, 189, 248, 0.16); }
-+.cv-search:focus { border-color: rgba(56, 189, 248, 0.55); }
-+.cv-close { width: 34px; height: 34px; border-radius: 9px; cursor: pointer; color: rgba(190, 220, 245, 0.7); background: rgba(56, 189, 248, 0.05); border: 1px solid rgba(56, 189, 248, 0.16); }
-+.cv-close:hover { color: #fff; border-color: rgba(56, 189, 248, 0.5); }
++.cv-head { display: flex; align-items: center; gap: 14px; padding: 16px 24px; border-bottom: 1px solid var(--acc-line); }
++.cv-heading { min-width: 200px; }
++.cv-title { font-family: var(--f-ui); font-size: 19px; font-weight: 700; letter-spacing: 4px; text-transform: uppercase; }
++.cv-sub { font-family: var(--f-mono); font-size: 10px; color: var(--acc); margin-top: 1px; letter-spacing: 1px; }
++.cv-live { display: flex; align-items: center; gap: 8px; font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); padding: 5px 10px; border: 1px solid var(--hair); white-space: nowrap; }
++.cv-live-dot { width: 6px; height: 6px; transform: rotate(45deg); background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: hud-blink 1.6s infinite; }
++.cv-live-dot.off { background: var(--bad); box-shadow: none; animation: none; }
++.cv-search { flex: 1; max-width: 440px; margin-left: auto; font-family: var(--f-text); font-size: 13.5px; color: inherit; padding: 9px 14px; outline: 0; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--acc-line); }
++.cv-search:focus { border-color: var(--acc); box-shadow: 0 0 0 3px var(--acc-soft); }
++.cv-close { width: 36px; height: 36px; cursor: pointer; color: var(--dim); background: transparent; border: 1px solid var(--hair); }
++.cv-close:hover { color: var(--acc); border-color: var(--acc); }
++.cv-transfer { padding: 10px 24px; font-family: var(--f-mono); font-size: 11.5px; line-height: 1.5; color: var(--text); background: var(--acc-soft); border-bottom: 1px solid var(--acc-line); }
 +
-+.cv-body { flex: 1; display: grid; grid-template-columns: 340px 1fr; min-height: 0; }
-+.cv-list { overflow-y: auto; padding: 12px; border-right: 1px solid rgba(56, 189, 248, 0.12); display: flex; flex-direction: column; gap: 6px; }
-+.cv-item { text-align: left; font: inherit; color: inherit; cursor: pointer; padding: 11px 13px; border-radius: 11px; background: transparent; border: 1px solid transparent; transition: all 0.12s; }
-+.cv-item:hover { background: rgba(255, 255, 255, 0.04); }
-+.cv-item.active { background: rgba(56, 189, 248, 0.11); border-color: rgba(56, 189, 248, 0.35); }
++.cv-body { flex: 1; display: grid; grid-template-columns: 360px 1fr; min-height: 0; }
++.cv-list { overflow-y: auto; padding: 12px; border-right: 1px solid var(--hair); display: flex; flex-direction: column; gap: 4px; }
++.cv-item { text-align: left; font: inherit; color: inherit; cursor: pointer; padding: 10px 12px; background: transparent; border: 1px solid transparent; border-left: 2px solid transparent; transition: all 0.12s; }
++.cv-item:hover { background: rgba(255, 255, 255, 0.03); border-left-color: var(--acc-line); }
++.cv-item.active { background: var(--acc-soft); border-color: var(--acc-line); border-left-color: var(--acc); }
 +.cv-item-top { display: flex; align-items: center; gap: 8px; }
 +.cv-item-title { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-+.cv-item-meta { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 10.5px; color: rgba(190, 220, 245, 0.45); }
-+.cv-tag { padding: 1px 7px; border-radius: 999px; background: rgba(56, 189, 248, 0.12); color: rgba(125, 211, 252, 0.9); }
-+.cv-pulse { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #34d399; box-shadow: 0 0 8px #34d399; animation: cv-pulse 1.4s infinite; }
++.cv-item-meta { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-family: var(--f-mono); font-size: 10px; color: var(--faint); }
++.cv-tag { padding: 1px 6px; color: var(--acc); border: 1px solid var(--acc-line); }
++.cv-pulse { flex: none; width: 6px; height: 6px; transform: rotate(45deg); background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: hud-blink 1.4s infinite; }
 +
 +.cv-view { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-+.cv-view-head { padding: 16px 28px 12px; border-bottom: 1px solid rgba(56, 189, 248, 0.1); }
-+.cv-view-title { font-size: 16px; font-weight: 600; line-height: 1.35; }
-+.cv-view-meta { font-size: 11px; color: rgba(190, 220, 245, 0.45); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.cv-view-head { padding: 16px 28px 12px; border-bottom: 1px solid var(--hair); }
++.cv-view-title { font-family: var(--f-ui); font-size: 19px; font-weight: 700; letter-spacing: 0.5px; line-height: 1.3; }
++.cv-view-meta { font-family: var(--f-mono); font-size: 10.5px; color: var(--faint); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 +.cv-actions { display: flex; gap: 8px; margin-top: 12px; }
-+.cv-btn { font: inherit; font-size: 12px; color: inherit; cursor: pointer; padding: 7px 13px; border-radius: 9px; background: rgba(56, 189, 248, 0.06); border: 1px solid rgba(56, 189, 248, 0.22); }
-+.cv-btn:hover { background: rgba(56, 189, 248, 0.16); }
-+.cv-btn-primary { color: #04121c; font-weight: 600; background: linear-gradient(135deg, #7dd3fc, #0ea5e9); border: 0; }
++.cv-btn { font-family: var(--f-ui); font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--dim); cursor: pointer; padding: 7px 13px; background: transparent; border: 1px solid var(--acc-line); white-space: nowrap; }
++.cv-btn:hover { color: var(--acc); border-color: var(--acc); box-shadow: 0 0 12px var(--acc-soft); }
++.cv-btn-primary { color: #02070c; background: var(--acc); border-color: var(--acc); box-shadow: 0 0 16px var(--acc-glow); }
++.cv-btn-primary:hover { color: #02070c; filter: brightness(1.1); }
 +
 +.cv-msgs { flex: 1; overflow-y: auto; padding: 20px 28px 30px; display: flex; flex-direction: column; gap: 12px; }
 +.cv-msg { display: flex; }
 +.cv-msg.user { justify-content: flex-end; }
-+.cv-bubble { max-width: min(760px, 88%); padding: 11px 15px; border-radius: 15px; font-size: 13.5px; line-height: 1.6; overflow-wrap: anywhere; }
-+.cv-msg.bot .cv-bubble { background: rgba(255, 255, 255, 0.045); border: 1px solid rgba(255, 255, 255, 0.07); border-bottom-left-radius: 5px; }
-+.cv-msg.user .cv-bubble { background: linear-gradient(135deg, rgba(56, 189, 248, 0.24), rgba(14, 116, 200, 0.2)); border: 1px solid rgba(56, 189, 248, 0.32); border-bottom-right-radius: 5px; }
-+.cv-bubble code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: rgba(0, 0, 0, 0.35); padding: 1px 5px; border-radius: 4px; }
-+.cv-bubble pre { margin: 8px 0 2px; padding: 10px 12px; background: rgba(0, 0, 0, 0.45); border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 8px; overflow-x: auto; }
-+.cv-bubble pre code { background: none; padding: 0; }
-+.cv-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-+.cv-tool { font-size: 10.5px; padding: 2px 8px; border-radius: 6px; color: rgba(125, 211, 252, 0.9); background: rgba(56, 189, 248, 0.09); border: 1px solid rgba(56, 189, 248, 0.2); }
-+.cv-stamp { margin-top: 6px; font-size: 10.5px; color: rgba(190, 220, 245, 0.4); text-align: right; }
-+.cv-empty { margin: 40px auto; max-width: 340px; text-align: center; font-size: 13px; line-height: 1.6; color: rgba(190, 220, 245, 0.4); }
++.cv-bubble { max-width: min(780px, 88%); padding: 10px 14px; font-size: 13.5px; line-height: 1.6; overflow-wrap: anywhere; }
++.cv-msg.bot .cv-bubble { background: linear-gradient(90deg, var(--acc-soft), rgba(255, 255, 255, 0.02) 40%); border-left: 2px solid var(--acc); box-shadow: inset 0 0 0 1px var(--hair); }
++.cv-msg.user .cv-bubble { background: rgba(255, 255, 255, 0.045); border-right: 2px solid rgba(233, 245, 255, 0.55); box-shadow: inset 0 0 0 1px var(--hair); }
++.cv-bubble code { font-family: var(--f-mono); font-size: 12px; color: var(--acc-strong); background: rgba(0, 0, 0, 0.45); padding: 1px 5px; }
++.cv-bubble pre { margin: 8px 0 2px; padding: 10px 12px; background: rgba(0, 0, 0, 0.55); border: 1px solid var(--hair); overflow-x: auto; }
++.cv-bubble pre code { background: none; padding: 0; color: #d6ecff; }
++.cv-tools { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
++.cv-tool { font-family: var(--f-mono); font-size: 10px; padding: 2px 7px; color: var(--acc); border: 1px solid var(--acc-line); }
++.cv-stamp { margin-top: 6px; font-family: var(--f-mono); font-size: 10px; color: var(--faint); text-align: right; }
++.cv-empty { margin: 40px auto; max-width: 360px; text-align: center; font-size: 13px; line-height: 1.6; color: var(--faint); }
 +
-+@keyframes cv-pulse { 50% { opacity: 0.35; } }
-+@media (max-width: 820px) { .cv-body { grid-template-columns: 1fr; } .cv-list { max-height: 34vh; border-right: 0; border-bottom: 1px solid rgba(56, 189, 248, 0.12); } .cv-heading { display: none; } }
++@media (max-width: 900px) { .cv-body { grid-template-columns: 1fr; } .cv-list { max-height: 34vh; border-right: 0; border-bottom: 1px solid var(--hair); } .cv-heading { display: none; } .cv-head { flex-wrap: wrap; } }
 diff --git a/frontend/src/chats.ts b/frontend/src/chats.ts
 new file mode 100644
-index 0000000..e0a44d3
+index 0000000..e73fb96
 --- /dev/null
 +++ b/frontend/src/chats.ts
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,328 @@
 +/**
 + * Conversations browser: every Claude Code chat on this machine, searchable,
 + * readable, and kept live. The list re-polls every few seconds and the open
@@ -1125,7 +1305,7 @@ index 0000000..e0a44d3
 + */
 +
 +import "./chats.css";
-+import { el, renderRich } from "./chat";
++import { el, renderRich, type StoredMsg } from "./chat";
 +
 +interface ChatRow {
 +  session_id: string;
@@ -1174,7 +1354,11 @@ index 0000000..e0a44d3
 +  return `hace ${Math.round(s / 86400)} d`;
 +}
 +
-+export function createChats(opts: { onAskJarvis(text: string): void }) {
++export function createChats(opts: {
++  onAskJarvis(text: string): void;
++  getChatHistory(): StoredMsg[];
++  mergeChatHistory(items: StoredMsg[]): number;
++}) {
 +  const root = el("div", "cv");
 +  root.hidden = true;
 +
@@ -1192,7 +1376,66 @@ index 0000000..e0a44d3
 +  const closeBtn = el("button", "cv-close", "✕");
 +  closeBtn.type = "button";
 +  closeBtn.title = "Cerrar (Esc)";
-+  head.append(heading, live, search, closeBtn);
++  const btnExport = el("button", "cv-btn", "Exportar");
++  const btnImport = el("button", "cv-btn", "Importar");
++  btnExport.type = btnImport.type = "button";
++  btnExport.title = "Descarga todas tus conversaciones y la memoria de JARVIS en un .zip para llevarlas a otro ordenador";
++  btnImport.title = "Carga un .zip exportado desde otro ordenador (no sobrescribe nada)";
++  const fileInput = el("input");
++  fileInput.type = "file";
++  fileInput.accept = ".zip,application/zip";
++  fileInput.hidden = true;
++  const transferMsg = el("div", "cv-transfer");
++  head.append(heading, live, search, btnExport, btnImport, fileInput, closeBtn);
++
++  btnExport.addEventListener("click", async () => {
++    transferMsg.textContent = "Preparando exportación…";
++    if (!transferMsg.isConnected) head.after(transferMsg);
++    try {
++      const r = await fetch("/api/transfer/export", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ chat_history: opts.getChatHistory() }),
++      });
++      if (!r.ok) throw new Error();
++      const blob = await r.blob();
++      const counts = JSON.parse(r.headers.get("X-Jarvis-Counts") || "{}");
++      const a = el("a");
++      a.href = URL.createObjectURL(blob);
++      a.download = `jarvis-conversaciones-${new Date().toISOString().slice(0, 10)}.zip`;
++      document.body.append(a);
++      a.click();
++      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
++      transferMsg.textContent = `Exportado: ${counts.conversations ?? 0} conversaciones, ${counts.memory_files ?? 0} notas de memoria y ${counts.chat_messages ?? 0} mensajes del chat. `
++        + "Guarda el .zip (USB, correo o la nube) e impórtalo en el otro ordenador. Contiene tus conversaciones: no lo compartas.";
++    } catch {
++      transferMsg.textContent = "No se pudo exportar. ¿Sigue en marcha el servidor de JARVIS?";
++    }
++  });
++
++  btnImport.addEventListener("click", () => fileInput.click());
++  fileInput.addEventListener("change", async () => {
++    const file = fileInput.files?.[0];
++    fileInput.value = "";
++    if (!file) return;
++    transferMsg.textContent = `Importando ${file.name}…`;
++    if (!transferMsg.isConnected) head.after(transferMsg);
++    try {
++      const r = await fetch("/api/transfer/import", {
++        method: "POST",
++        headers: { "Content-Type": "application/zip" },
++        body: file,
++      });
++      const res = await r.json();
++      if (!r.ok) throw new Error(res.error || "error");
++      const merged = opts.mergeChatHistory(Array.isArray(res.chat_history) ? res.chat_history : []);
++      transferMsg.textContent = `Importado: ${res.conversations} conversaciones nuevas, ${res.updated} actualizadas, `
++        + `${res.memory_files} notas de memoria y ${merged} mensajes del chat.`;
++      void refreshList();
++    } catch (e) {
++      transferMsg.textContent = `No se pudo importar: ${e instanceof Error && e.message !== "error" ? e.message : "archivo no válido"}`;
++    }
++  });
 +
 +  // ── body: list + viewer ──────────────────────────────────────────────────
 +  const body = el("div", "cv-body");
@@ -1384,177 +1627,349 @@ index 0000000..e0a44d3
 +}
 diff --git a/frontend/src/hud.css b/frontend/src/hud.css
 new file mode 100644
-index 0000000..8fd767e
+index 0000000..412ad02
 --- /dev/null
 +++ b/frontend/src/hud.css
-@@ -0,0 +1,125 @@
-+/* Command-centre HUD — sits over the orb; hidden on narrow screens. */
+@@ -0,0 +1,297 @@
++/* ════════════════════════════════════════════════════════════════════════════
++   JARVIS · command-centre HUD
++   The accent follows the orb's colour (--orb-h, written by orb.ts) in Claude mode and is
++   pinned to emerald in Codex mode. Everything else derives from these tokens.
++   ════════════════════════════════════════════════════════════════════════════ */
 +
-+.hud-brand { position: fixed; top: 22px; left: 28px; z-index: 12; color: #e6f3ff; pointer-events: none; }
-+.hud-title { font-size: 22px; font-weight: 700; letter-spacing: 5px; }
-+.hud-title small { font-size: 11px; font-weight: 400; letter-spacing: 2px; color: rgba(56, 189, 248, 0.7); }
-+.hud-tag { margin-top: 3px; font-size: 9.5px; letter-spacing: 3px; color: rgba(190, 220, 245, 0.4); }
-+.hud-clock { margin-top: 16px; font-size: 26px; font-variant-numeric: tabular-nums; font-weight: 300; letter-spacing: 2px; color: rgba(230, 243, 255, 0.92); }
-+.hud-date { font-size: 10px; letter-spacing: 2.5px; color: rgba(190, 220, 245, 0.4); margin-top: 2px; }
-+
-+.hud-modes {
-+  position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 12;
-+  display: flex; gap: 4px; padding: 4px;
-+  background: rgba(10, 16, 26, 0.7); border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 12px;
-+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
-+  transition: left 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++:root {
++  --acc-h: var(--orb-h, 198);
++  --acc: hsl(var(--acc-h) 95% 64%);
++  --acc-strong: hsl(var(--acc-h) 100% 72%);
++  --acc-soft: hsl(var(--acc-h) 95% 60% / 0.12);
++  --acc-line: hsl(var(--acc-h) 90% 66% / 0.28);
++  --acc-glow: hsl(var(--acc-h) 100% 60% / 0.45);
++  --bg: #02050a;
++  --panel: rgba(5, 11, 19, 0.66);
++  --text: #e9f5ff;
++  --dim: rgba(178, 208, 234, 0.58);
++  --faint: rgba(178, 208, 234, 0.3);
++  --hair: rgba(150, 200, 240, 0.1);
++  --ok: #3ef0b0;
++  --warn: #ffc24b;
++  --bad: #ff5a70;
++  --f-ui: "Rajdhani", "Segoe UI", system-ui, sans-serif;
++  --f-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
++  --f-text: "Inter", "Segoe UI", system-ui, sans-serif;
++  --left-w: 300px;
++  --chat-w: 460px;
++  --stage-x: 50vw;
++  --ease: cubic-bezier(0.22, 0.8, 0.24, 1);
 +}
-+body.chat-open .hud-modes { left: calc((100% - min(440px, 100vw) + 280px) / 2); }
-+.hud-mode { border: 0; background: transparent; color: rgba(190, 220, 245, 0.5); font: inherit; font-size: 12.5px; padding: 7px 16px; border-radius: 9px; cursor: pointer; }
-+.hud-mode.active { background: rgba(56, 189, 248, 0.16); color: #e6f3ff; }
-+.hud-mode:disabled { opacity: 0.4; cursor: not-allowed; }
++body[data-agent="codex"] { --acc-h: 156; }
 +
++html, body { background: var(--bg); color: var(--text); font-family: var(--f-text); }
++
++/* Ambient layers: vignette, a faint grid and scanlines. Purely decorative. */
++body::before {
++  content: ""; position: fixed; inset: 0; z-index: 1; pointer-events: none;
++  background:
++    radial-gradient(ellipse at var(--stage-x) 50%, transparent 0 34%, rgba(1, 3, 7, 0.55) 72%, rgba(1, 3, 7, 0.92) 100%),
++    linear-gradient(var(--hair) 1px, transparent 1px) 0 0 / 56px 56px,
++    linear-gradient(90deg, var(--hair) 1px, transparent 1px) 0 0 / 56px 56px;
++  mask-image: radial-gradient(ellipse at 50% 50%, #000 40%, transparent 100%);
++  opacity: 0.55;
++}
++body::after {
++  content: ""; position: fixed; inset: 0; z-index: 60; pointer-events: none;
++  background: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.018) 0 1px, transparent 1px 3px);
++  mix-blend-mode: overlay;
++}
++
++/* Corner brackets for any framed surface. */
++.hud-frame, .hud-sec, .hud-convos {
++  --c: var(--acc-line); --l: 12px;
++  background:
++    linear-gradient(var(--c), var(--c)) top left / var(--l) 1px no-repeat,
++    linear-gradient(var(--c), var(--c)) top left / 1px var(--l) no-repeat,
++    linear-gradient(var(--c), var(--c)) top right / var(--l) 1px no-repeat,
++    linear-gradient(var(--c), var(--c)) top right / 1px var(--l) no-repeat,
++    linear-gradient(var(--c), var(--c)) bottom left / var(--l) 1px no-repeat,
++    linear-gradient(var(--c), var(--c)) bottom left / 1px var(--l) no-repeat,
++    linear-gradient(var(--c), var(--c)) bottom right / var(--l) 1px no-repeat,
++    linear-gradient(var(--c), var(--c)) bottom right / 1px var(--l) no-repeat,
++    var(--panel);
++}
++
++/* ── brand ─────────────────────────────────────────────────────────────────── */
++.hud-brand { position: fixed; top: 22px; left: 28px; z-index: 12; pointer-events: none; }
++.hud-word { font-family: var(--f-ui); font-weight: 700; font-size: 24px; letter-spacing: 6px; color: var(--text); text-shadow: 0 0 18px var(--acc-glow); }
++.hud-word small { margin-left: 8px; font-size: 11px; letter-spacing: 2px; color: var(--acc); vertical-align: super; }
++.hud-tag { margin-top: 2px; font-family: var(--f-ui); font-size: 10.5px; font-weight: 600; letter-spacing: 4.5px; color: var(--faint); }
++.hud-clock { margin-top: 14px; font-family: var(--f-mono); font-size: 25px; font-weight: 300; letter-spacing: 1px; color: var(--text); }
++.hud-date { font-family: var(--f-ui); font-size: 11px; font-weight: 600; letter-spacing: 3px; color: var(--dim); }
++
++/* ── agent switch ─────────────────────────────────────────────────────────── */
++.hud-modes {
++  position: fixed; top: 20px; left: var(--stage-x); transform: translateX(-50%); z-index: 14;
++  display: grid; grid-template-columns: 1fr 1fr; padding: 4px; min-width: 330px;
++  background: rgba(4, 9, 16, 0.78); border: 1px solid var(--acc-line); border-radius: 3px;
++  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
++  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4), 0 10px 40px rgba(0, 0, 0, 0.45);
++  transition: left 0.4s var(--ease), border-color 0.4s;
++}
++.hud-mode-slider {
++  position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px);
++  background: linear-gradient(135deg, var(--acc-soft), hsl(var(--acc-h) 95% 60% / 0.26));
++  border: 1px solid var(--acc); box-shadow: 0 0 18px var(--acc-glow), inset 0 0 12px var(--acc-soft);
++  transition: transform 0.4s var(--ease);
++}
++.hud-modes[data-active="codex"] .hud-mode-slider { transform: translateX(100%); }
++.hud-mode {
++  position: relative; z-index: 1; display: flex; align-items: center; gap: 10px; justify-content: center;
++  padding: 7px 16px; border: 0; background: none; cursor: pointer; color: var(--dim);
++  font-family: var(--f-ui); transition: color 0.25s;
++}
++.hud-mode.active { color: var(--text); }
++.hud-mode-txt { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.05; }
++.hud-mode-name { font-size: 13.5px; font-weight: 700; letter-spacing: 2px; }
++.hud-mode-sub { font-size: 9.5px; font-weight: 600; letter-spacing: 2px; color: var(--faint); text-transform: uppercase; }
++.hud-mode-dot { width: 6px; height: 6px; transform: rotate(45deg); background: #56657a; }
++.hud-mode-dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
++.hud-mode-dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
++
++/* ── left column ─────────────────────────────────────────────────────────── */
 +.hud-left {
-+  position: fixed; top: 150px; left: 24px; bottom: 76px; width: 256px; z-index: 12;
-+  display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 4px;
++  position: fixed; top: 140px; left: 22px; bottom: 70px; width: calc(var(--left-w) - 30px); z-index: 12;
++  display: flex; flex-direction: column; gap: 12px; overflow-y: auto; padding: 2px 4px 2px 2px;
++  scrollbar-width: none;
 +}
 +.hud-left::-webkit-scrollbar { width: 0; }
-+.hud-h { font-size: 10px; letter-spacing: 2.6px; color: rgba(190, 220, 245, 0.45); margin: 2px 2px 0; }
-+.hud-h2 { margin-top: 10px; }
-+.hud-cards { display: flex; flex-direction: column; gap: 9px; }
-+.hud-card {
-+  padding: 12px 14px; border-radius: 12px;
-+  background: linear-gradient(160deg, rgba(56, 189, 248, 0.07), rgba(8, 13, 22, 0.55));
-+  border: 1px solid rgba(56, 189, 248, 0.14);
-+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
++.hud-convos {
++  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; text-align: left;
++  padding: 13px 14px; cursor: pointer; color: var(--text); border: 0; font: inherit;
++  --c: var(--acc); box-shadow: inset 0 0 0 1px var(--acc-line), 0 0 24px var(--acc-soft);
++  transition: transform 0.2s var(--ease), box-shadow 0.2s;
 +}
-+.hud-card-label { font-size: 9.5px; letter-spacing: 2px; color: rgba(190, 220, 245, 0.5); }
-+.hud-card-value { font-size: 30px; font-weight: 300; color: #f0f9ff; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
-+.hud-card-sub { font-size: 10.5px; color: rgba(190, 220, 245, 0.45); margin-top: 6px; }
-+.hud-bar { height: 4px; border-radius: 4px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
-+.hud-bar i { display: block; height: 100%; background: linear-gradient(90deg, #0ea5e9, #7dd3fc); border-radius: 4px; transition: width 0.6s; }
-+.hud-bar i.hot { background: linear-gradient(90deg, #f59e0b, #ef4444); }
++.hud-convos:hover { transform: translateX(3px); box-shadow: inset 0 0 0 1px var(--acc), 0 0 30px var(--acc-soft); }
++.hud-convos-icon { color: var(--acc); display: grid; place-items: center; }
++.hud-convos-txt { display: flex; flex-direction: column; min-width: 0; }
++.hud-convos-title { font-family: var(--f-ui); font-size: 15px; font-weight: 700; letter-spacing: 0.6px; }
++.hud-convos-sub { font-size: 10.5px; color: var(--dim); }
++.hud-convos-count { font-family: var(--f-mono); font-size: 16px; color: var(--acc); }
 +
-+.hud-runs { display: flex; flex-direction: column; gap: 6px; }
-+.hud-run { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: rgba(230, 243, 255, 0.75); padding: 7px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.035); }
-+.hud-run-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-+.hud-empty { font-size: 11px; line-height: 1.5; color: rgba(190, 220, 245, 0.35); padding: 2px; }
-+.hud-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
-+.hud-dot.running, .hud-dot.queued { background: #38bdf8; box-shadow: 0 0 8px #38bdf8; }
-+.hud-dot.succeeded { background: #34d399; }
-+.hud-dot.failed, .hud-dot.timed_out { background: #ef4444; }
++.hud-sec { padding: 12px 14px 13px; box-shadow: inset 0 0 0 1px rgba(150, 200, 240, 0.06); }
++.hud-h { margin: 0 0 10px; font-family: var(--f-ui); font-size: 11px; font-weight: 700; letter-spacing: 3px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
++.hud-h::before { content: ""; width: 5px; height: 5px; background: var(--acc); box-shadow: 0 0 8px var(--acc); transform: rotate(45deg); }
++.hud-note { font-size: 10.5px; color: var(--faint); margin-top: 6px; }
 +
++.hud-gauges { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
++.hud-gauge { position: relative; display: grid; justify-items: center; }
++.hud-gauge-svg { width: 100%; max-width: 116px; aspect-ratio: 1; }
++.hud-gauge-track { fill: none; stroke: rgba(255, 255, 255, 0.07); stroke-width: 5; stroke-linecap: butt; }
++.hud-gauge-arc { fill: none; stroke: var(--acc); stroke-width: 5; filter: drop-shadow(0 0 4px var(--acc-glow)); transition: stroke-dasharray 0.8s var(--ease); }
++.hud-gauge.hot .hud-gauge-arc { stroke: var(--bad); filter: drop-shadow(0 0 4px var(--bad)); }
++.hud-gauge-mid { position: absolute; top: 30%; left: 0; right: 0; text-align: center; }
++.hud-gauge-big { font-family: var(--f-mono); font-size: 21px; color: var(--text); }
++.hud-gauge.empty .hud-gauge-big { color: var(--faint); }
++.hud-gauge-label { font-family: var(--f-ui); font-size: 9.5px; font-weight: 700; letter-spacing: 1.8px; color: var(--dim); }
++.hud-gauge-sub { margin-top: -10px; font-family: var(--f-mono); font-size: 9.5px; color: var(--faint); min-height: 12px; }
++
++.hud-big { font-family: var(--f-mono); font-size: 34px; font-weight: 300; color: var(--text); line-height: 1; text-shadow: 0 0 20px var(--acc-soft); }
++.hud-big-label { font-family: var(--f-ui); font-size: 10.5px; font-weight: 600; letter-spacing: 2px; color: var(--faint); margin: 3px 0 10px; text-transform: uppercase; }
++.hud-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
++.hud-stat { display: flex; flex-direction: column; padding: 6px 7px; background: rgba(255, 255, 255, 0.025); border-left: 1px solid var(--acc-line); }
++.hud-stat-v { font-family: var(--f-mono); font-size: 14px; color: var(--text); }
++.hud-stat-l { font-family: var(--f-ui); font-size: 9.5px; font-weight: 600; letter-spacing: 0.4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--faint); text-transform: uppercase; }
++.hud-spark { width: 100%; height: 26px; margin: 10px 0 6px; }
++.hud-spark-line { fill: none; stroke: var(--acc); stroke-width: 1.2; vector-effect: non-scaling-stroke; }
++.hud-spark-fill { fill: var(--acc-soft); stroke: none; }
++.hud-models { display: flex; flex-direction: column; gap: 5px; }
++.hud-model { display: grid; grid-template-columns: 90px 1fr auto; align-items: center; gap: 8px; font-size: 10.5px; }
++.hud-model-name { font-family: var(--f-mono); color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.hud-model-bar { height: 3px; background: rgba(255, 255, 255, 0.06); }
++.hud-model-bar i { display: block; height: 100%; background: var(--acc); box-shadow: 0 0 6px var(--acc-glow); }
++.hud-model-v { font-family: var(--f-mono); color: var(--faint); }
++
++.hud-list { display: flex; flex-direction: column; gap: 3px; }
++.hud-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 6px 8px; font-size: 11.5px; background: rgba(255, 255, 255, 0.02); border-left: 1px solid transparent; transition: border-color 0.2s, background 0.2s; }
++.hud-row:hover { border-left-color: var(--acc); background: var(--acc-soft); }
++.hud-row-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: rgba(233, 245, 255, 0.85); }
++.hud-row-meta { font-family: var(--f-mono); font-size: 9.5px; color: var(--faint); text-transform: uppercase; }
++.hud-empty { font-size: 11px; line-height: 1.5; color: var(--faint); padding: 2px; }
++.hud-dot { flex: none; width: 6px; height: 6px; transform: rotate(45deg); background: #56657a; }
++.hud-dot.busy { background: var(--acc); box-shadow: 0 0 8px var(--acc); animation: hud-blink 1.4s infinite; }
++.hud-dot.ok { background: var(--ok); }
++.hud-dot.alert { background: var(--bad); box-shadow: 0 0 8px var(--bad); animation: hud-blink 0.9s infinite; }
++
++/* ── stage: rings around the orb ──────────────────────────────────────────── */
++.hud-stage {
++  position: fixed; top: 50%; left: var(--stage-x); z-index: 2; pointer-events: none;
++  width: min(78vh, calc(100vw - var(--left-w) - var(--chat-w) - 40px)); aspect-ratio: 1;
++  transform: translate(-50%, -50%); transition: left 0.4s var(--ease);
++}
++.hud-rings { width: 100%; height: 100%; overflow: visible; }
++.ring { fill: none; stroke: var(--acc); transform-origin: 0 0; transition: stroke 0.6s, opacity 0.6s; }
++.ring-ticks line { stroke: var(--acc); stroke-width: 0.35; opacity: 0.45; }
++.ring-ticks { animation: hud-spin 120s linear infinite; }
++.ring-arcs path { fill: none; stroke: var(--acc); stroke-width: 0.9; opacity: 0.7; filter: drop-shadow(0 0 2px var(--acc-glow)); }
++.ring-arcs { animation: hud-spin 40s linear infinite reverse; }
++.ring-seg { stroke-width: 0.5; stroke-dasharray: 1 3.5; opacity: 0.55; animation: hud-spin 60s linear infinite; }
++.ring-dash { stroke-width: 0.3; stroke-dasharray: 18 6 2 6; opacity: 0.35; animation: hud-spin 90s linear infinite reverse; }
++.ring-level { stroke-width: 1.4; opacity: 0.9; transform: rotate(-90deg); stroke-linecap: round; filter: drop-shadow(0 0 3px var(--acc-glow)); transition: stroke-dasharray 0.12s linear; }
++.hud-stage[data-state="hearing"] .ring-arcs { animation-duration: 6s; }
++.hud-stage[data-state="hearing"] .ring-seg { animation-duration: 12s; opacity: 0.9; }
++.hud-stage[data-state="thinking"] .ring-arcs { animation-duration: 3.5s; }
++.hud-stage[data-state="thinking"] .ring-dash { animation-duration: 8s; opacity: 0.7; }
++.hud-stage[data-state="speaking"] .ring-arcs { animation-duration: 10s; }
++.hud-stage[data-state="muted"] .ring, .hud-stage[data-state="blocked"] .ring { opacity: 0.18; animation-play-state: paused; }
++
++/* ── reactor (microphone) ─────────────────────────────────────────────────── */
++.hud-reactor-wrap {
++  position: fixed; bottom: 70px; left: var(--stage-x); transform: translateX(-50%); z-index: 13;
++  display: flex; flex-direction: column; align-items: center; gap: 6px; transition: left 0.4s var(--ease);
++}
++.hud-reactor {
++  --size: 86px; position: relative; width: var(--size); height: var(--size); border-radius: 50%; cursor: pointer;
++  border: 1px solid var(--acc-line); color: var(--acc);
++  background: radial-gradient(circle at 50% 40%, hsl(var(--acc-h) 90% 50% / 0.22), rgba(3, 8, 14, 0.9) 68%);
++  box-shadow: 0 0 0 6px rgba(2, 5, 10, 0.6), 0 0 0 7px var(--acc-line), 0 0 34px var(--acc-soft), inset 0 0 22px var(--acc-soft);
++  display: grid; place-items: center; transition: box-shadow 0.3s, color 0.3s, transform 0.15s;
++}
++.hud-reactor:hover { transform: scale(1.04); }
++.hud-reactor:active { transform: scale(0.96); }
++.hud-reactor-core { position: relative; z-index: 2; display: grid; place-items: center; filter: drop-shadow(0 0 6px var(--acc-glow)); }
++.hud-reactor-bars { position: absolute; inset: -18px; pointer-events: none; }
++.hud-reactor-bars i {
++  position: absolute; left: 50%; top: 50%; width: 2px; height: 14px; margin: -7px 0 0 -1px;
++  background: var(--acc); opacity: 0.75; border-radius: 1px;
++  transform: rotate(var(--a)) translateY(calc(-1 * (var(--size) / 2 + 13px))) scaleY(var(--h, 0.12));
++  transform-origin: 50% 50%; transition: transform 0.09s linear;
++}
++.hud-reactor[data-state="listening"] { animation: hud-breathe 2.8s ease-in-out infinite; }
++.hud-reactor[data-state="hearing"] { color: #fff; background: radial-gradient(circle at 50% 40%, hsl(var(--acc-h) 100% 60% / 0.55), rgba(3, 8, 14, 0.9) 70%); box-shadow: 0 0 0 6px rgba(2, 5, 10, 0.6), 0 0 0 7px var(--acc), 0 0 60px var(--acc-glow), inset 0 0 30px var(--acc-glow); }
++.hud-reactor[data-state="thinking"], .hud-reactor[data-state="compacting"] { color: var(--warn); box-shadow: 0 0 0 6px rgba(2, 5, 10, 0.6), 0 0 0 7px rgba(255, 194, 75, 0.45), 0 0 34px rgba(255, 194, 75, 0.25); }
++.hud-reactor[data-state="thinking"] .hud-reactor-bars { animation: hud-spin 1.6s linear infinite; }
++.hud-reactor[data-state="thinking"] .hud-reactor-bars i { --h: 0.35; background: var(--warn); }
++.hud-reactor[data-state="speaking"] { color: var(--ok); box-shadow: 0 0 0 6px rgba(2, 5, 10, 0.6), 0 0 0 7px rgba(62, 240, 176, 0.5), 0 0 40px rgba(62, 240, 176, 0.3); }
++.hud-reactor[data-state="speaking"] .hud-reactor-bars i { background: var(--ok); animation: hud-eq 0.7s ease-in-out infinite alternate; }
++.hud-reactor[data-state="speaking"] .hud-reactor-bars i:nth-child(3n) { animation-delay: 0.2s; }
++.hud-reactor[data-state="speaking"] .hud-reactor-bars i:nth-child(3n + 1) { animation-delay: 0.35s; }
++.hud-reactor[data-state="muted"], .hud-reactor[data-state="blocked"] { color: rgba(255, 90, 112, 0.9); border-color: rgba(255, 90, 112, 0.35); box-shadow: 0 0 0 6px rgba(2, 5, 10, 0.6), 0 0 0 7px rgba(255, 90, 112, 0.3); background: radial-gradient(circle at 50% 40%, rgba(255, 90, 112, 0.12), rgba(3, 8, 14, 0.92) 68%); }
++.hud-reactor[data-state="muted"] .hud-reactor-core::after { content: ""; position: absolute; width: 34px; height: 2px; background: currentColor; transform: rotate(-45deg); }
++.hud-reactor-label { font-family: var(--f-ui); font-size: 13px; font-weight: 700; letter-spacing: 4px; color: var(--text); margin-top: 8px; }
++.hud-reactor-wrap[data-state="hearing"] .hud-reactor-label { color: var(--acc-strong); text-shadow: 0 0 12px var(--acc-glow); }
++.hud-reactor-sub { font-family: var(--f-mono); font-size: 10px; color: var(--faint); min-height: 13px; letter-spacing: 0.5px; }
++.hud-heard {
++  max-width: min(560px, 48vw); margin-bottom: 14px; padding: 8px 16px; font-size: 14px; text-align: center; color: var(--dim);
++  background: rgba(3, 8, 14, 0.75); border: 1px solid var(--hair); border-left: 2px solid var(--acc);
++  opacity: 0; transform: translateY(6px); transition: opacity 0.25s, transform 0.25s; pointer-events: none;
++}
++.hud-heard::before { content: "› "; color: var(--acc); font-family: var(--f-mono); }
++.hud-heard.show { opacity: 1; transform: none; }
++.hud-heard.final { color: var(--text); }
++
++/* ── bottom bar ───────────────────────────────────────────────────────────── */
 +.hud-bottom {
-+  position: fixed; left: 0; bottom: 0; height: 52px; z-index: 12; display: flex; align-items: center; gap: 16px;
-+  right: 0; padding: 0 24px; background: linear-gradient(0deg, rgba(5, 8, 14, 0.92), rgba(5, 8, 14, 0.6));
-+  border-top: 1px solid rgba(56, 189, 248, 0.12);
-+  transition: right 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++  position: fixed; left: 0; right: 0; bottom: 0; height: 46px; z-index: 12; display: flex; align-items: center; gap: 14px; padding: 0 22px;
++  background: linear-gradient(0deg, rgba(2, 5, 10, 0.95), rgba(2, 5, 10, 0.7)); border-top: 1px solid var(--hair);
++  transition: right 0.4s var(--ease);
 +}
-+body.chat-open .hud-bottom { right: min(440px, 100vw); }
-+.hud-term-label { font-size: 10px; letter-spacing: 2.4px; color: rgba(190, 220, 245, 0.55); white-space: nowrap; }
-+.hud-term-count { color: rgba(56, 189, 248, 0.8); }
-+.hud-term-chips { flex: 1; display: flex; gap: 8px; overflow-x: auto; }
-+.hud-term-chips::-webkit-scrollbar { height: 0; }
-+.hud-term-chip { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; padding: 5px 11px; border-radius: 999px; white-space: nowrap; color: #dbeafe; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.08); }
-+.hud-term-chip.needs { border-color: rgba(239, 68, 68, 0.5); background: rgba(239, 68, 68, 0.1); }
-+.hud-talk { border: 1px solid rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.1); color: #e6f3ff; font: inherit; font-size: 12px; letter-spacing: 1px; padding: 7px 18px; border-radius: 9px; cursor: pointer; }
-+.hud-talk:hover { background: rgba(56, 189, 248, 0.2); }
++body.chat-open .hud-bottom { right: min(var(--chat-w), 100vw); }
++.hud-bottom-label { font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spacing: 3px; color: var(--faint); }
++.hud-chips { flex: 1; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
++.hud-chips::-webkit-scrollbar { height: 0; }
++.hud-chip { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; white-space: nowrap; font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); border: 1px solid var(--hair); background: rgba(255, 255, 255, 0.02); }
++.hud-chip.alert { border-color: rgba(255, 90, 112, 0.5); color: #ffd0d7; }
++.hud-chip.dim { color: var(--faint); }
++.hud-sys { display: flex; gap: 12px; }
++.hud-sys-item { display: inline-flex; align-items: center; gap: 6px; font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spacing: 2px; color: var(--faint); cursor: default; }
++.hud-sys-item::before { content: ""; width: 6px; height: 6px; transform: rotate(45deg); background: #56657a; }
++.hud-sys-item[data-state="ok"] { color: var(--dim); }
++.hud-sys-item[data-state="ok"]::before { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
++.hud-sys-item[data-state="warn"]::before { background: var(--warn); box-shadow: 0 0 6px var(--warn); animation: hud-blink 1.2s infinite; }
++.hud-sys-item[data-state="bad"] { color: #ffb3bf; }
++.hud-sys-item[data-state="bad"]::before { background: var(--bad); box-shadow: 0 0 6px var(--bad); animation: hud-blink 0.9s infinite; }
++.hud-lang { font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); background: transparent; border: 1px solid var(--hair); padding: 5px 6px; outline: 0; cursor: pointer; }
++.hud-lang:focus { border-color: var(--acc); }
++.hud-lang option { background: #050a12; color: var(--text); }
 +
-+/* The orb's own footer labels are replaced by the bar. */
-+#jarvis-label, #mic-level { display: none; }
-+#status-text { bottom: 70px; }
++/* ── toasts ───────────────────────────────────────────────────────────────── */
++.hud-toasts { position: fixed; top: 78px; left: var(--stage-x); transform: translateX(-50%); z-index: 40; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; transition: left 0.4s var(--ease); }
++.hud-toast {
++  display: flex; align-items: stretch; max-width: min(520px, 70vw); overflow: hidden;
++  background: rgba(4, 9, 16, 0.9); border: 1px solid var(--hair); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
++  opacity: 0; transform: translateY(-8px); transition: opacity 0.3s, transform 0.3s var(--ease);
++}
++.hud-toast.show { opacity: 1; transform: none; }
++.hud-toast-bar { width: 3px; background: var(--acc); box-shadow: 0 0 8px var(--acc); }
++.hud-toast.warn .hud-toast-bar { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
++.hud-toast-text { padding: 9px 14px; font-size: 12.5px; line-height: 1.45; color: var(--text); }
++
++/* ── top-right controls restyled; the old mute button lives on in the reactor ─ */
++#controls { top: 20px; right: 20px; z-index: 20; transition: right 0.4s var(--ease); }
++body.chat-open #controls { right: calc(min(var(--chat-w), 100vw) + 16px); }
++#controls button { width: 38px; height: 38px; border-radius: 2px; border: 1px solid var(--acc-line); background: rgba(4, 9, 16, 0.7); color: var(--dim); }
++#controls button:hover, #controls button.active { color: var(--acc); border-color: var(--acc); box-shadow: 0 0 14px var(--acc-soft); background: rgba(4, 9, 16, 0.9); }
++#btn-mute { display: none !important; }
++#menu-dropdown { right: 20px !important; top: 66px !important; border-radius: 2px !important; border: 1px solid var(--acc-line) !important; background: rgba(4, 9, 16, 0.95) !important; font-family: var(--f-ui); letter-spacing: 1px; }
++body.chat-open #menu-dropdown { right: calc(min(var(--chat-w), 100vw) + 16px) !important; }
++#status-text, #error-text, #jarvis-label, #mic-level, #hush { display: none !important; }
++
++@keyframes hud-spin { to { transform: rotate(360deg); } }
++@keyframes hud-blink { 50% { opacity: 0.35; } }
++@keyframes hud-breathe { 50% { box-shadow: 0 0 0 6px rgba(2, 5, 10, 0.6), 0 0 0 7px var(--acc), 0 0 46px var(--acc-glow), inset 0 0 22px var(--acc-soft); } }
++@keyframes hud-eq { from { --h: 0.15; transform: rotate(var(--a)) translateY(calc(-1 * (var(--size) / 2 + 13px))) scaleY(0.15); } to { transform: rotate(var(--a)) translateY(calc(-1 * (var(--size) / 2 + 13px))) scaleY(0.9); } }
 +
 +@media (max-width: 1199px) {
-+  .hud-left, .hud-modes, .hud-brand { display: none; }
++  :root { --left-w: 0px; }
++  .hud-left, .hud-brand { display: none; }
 +}
-+
-+body #error-text { top: 76px; z-index: 13; }
-+
-+.hud-chats {
-+  display: flex; flex-direction: column; gap: 3px; text-align: left; font: inherit; cursor: pointer; color: #e6f3ff;
-+  padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(56, 189, 248, 0.38);
-+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(14, 116, 200, 0.1));
-+  transition: all 0.15s;
++@media (max-width: 760px) {
++  :root { --chat-w: 100vw; }
++  .hud-modes { min-width: 0; top: 70px; }
++  .hud-sys, .hud-bottom-label { display: none; }
 +}
-+.hud-chats:hover { border-color: rgba(125, 211, 252, 0.8); transform: translateY(-1px); }
-+.hud-chats-title { font-size: 13px; font-weight: 600; }
-+.hud-chats-sub { font-size: 10.5px; color: rgba(190, 220, 245, 0.55); }
-+
-+/* ── talk button: live state ────────────────────────────────────────────── */
-+.hud-talk { display: inline-flex; align-items: center; gap: 10px; min-width: 190px; justify-content: center; transition: all 0.2s; }
-+.hud-bars { display: inline-flex; align-items: center; gap: 3px; height: 24px; }
-+.hud-bars i { display: block; width: 3px; height: 4px; border-radius: 3px; background: currentColor; opacity: 0.7; transition: height 0.12s ease; }
-+.hud-talk[data-state="listening"] { border-color: hsla(var(--orb-h, 200), 80%, 60%, 0.5); color: hsl(var(--orb-h, 200), 85%, 78%); animation: hud-breathe 2.4s ease-in-out infinite; }
-+.hud-talk[data-state="hearing"] { background: hsla(var(--orb-h, 200), 80%, 55%, 0.28); border-color: hsl(var(--orb-h, 200), 85%, 65%); color: #fff; box-shadow: 0 0 22px hsla(var(--orb-h, 200), 90%, 60%, 0.55); }
-+.hud-talk[data-state="thinking"], .hud-talk[data-state="compacting"] { color: #fbbf24; border-color: rgba(251, 191, 36, 0.5); background: rgba(251, 191, 36, 0.08); }
-+.hud-talk[data-state="speaking"] { color: #34d399; border-color: rgba(52, 211, 153, 0.55); background: rgba(52, 211, 153, 0.1); }
-+.hud-talk[data-state="muted"] { color: rgba(248, 113, 113, 0.9); border-color: rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.07); }
-+.hud-talk[data-state="thinking"] .hud-bars i, .hud-talk[data-state="speaking"] .hud-bars i { animation: hud-bar 0.9s ease-in-out infinite; }
-+.hud-talk[data-state="thinking"] .hud-bars i:nth-child(2n), .hud-talk[data-state="speaking"] .hud-bars i:nth-child(2n) { animation-delay: 0.2s; }
-+.hud-talk[data-state="speaking"] .hud-bars i:nth-child(3) { animation-delay: 0.4s; }
-+.hud-talk[data-state="listening"] .hud-bars i { height: 6px; }
-+
-+.hud-lang { font: inherit; font-size: 11.5px; color: #dbeafe; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 6px 8px; outline: 0; cursor: pointer; }
-+.hud-lang option { background: #0a0f18; }
-+
-+/* What the recogniser heard, floating under the orb. */
-+.hud-heard {
-+  position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%) translateY(6px); z-index: 12;
-+  max-width: min(640px, 60vw); padding: 8px 16px; border-radius: 999px; font-size: 14px; text-align: center;
-+  color: rgba(230, 243, 255, 0.75); background: rgba(8, 13, 22, 0.7); border: 1px solid rgba(56, 189, 248, 0.16);
-+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
-+  opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s, left 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++@media (prefers-reduced-motion: reduce) {
++  .ring, .hud-reactor, .hud-reactor-bars, .hud-reactor-bars i { animation: none !important; }
 +}
-+.hud-heard.show { opacity: 1; transform: translateX(-50%); }
-+.hud-heard.final { color: #fff; border-color: hsla(var(--orb-h, 200), 80%, 60%, 0.5); }
-+body.chat-open .hud-heard { left: calc((100% - min(440px, 100vw) + 280px) / 2); }
-+
-+@keyframes hud-breathe { 50% { box-shadow: 0 0 16px hsla(var(--orb-h, 200), 90%, 60%, 0.35); } }
-+@keyframes hud-bar { 0%, 100% { height: 5px; } 50% { height: 17px; } }
-+
-+.hud-mode { display: inline-flex; align-items: center; gap: 8px; }
-+.hud-mode-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
-+.hud-mode-dot.ok { background: #34d399; box-shadow: 0 0 7px #34d399; }
-+.hud-mode-dot.warn { background: #fbbf24; }
-+.hud-mode-dot.off { background: #64748b; }
-+.hud-mode:disabled { opacity: 1; cursor: pointer; }
 diff --git a/frontend/src/hud.ts b/frontend/src/hud.ts
 new file mode 100644
-index 0000000..83ea0f1
+index 0000000..12329ad
 --- /dev/null
 +++ b/frontend/src/hud.ts
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,474 @@
 +/**
-+ * Command-centre HUD around the orb: brand + clock, mode switch, live vitals
-+ * (subscription windows, today's runs, recent runs) and a terminals bar that
-+ * lists every Claude Code session on the machine. All numbers come from the
-+ * JARVIS REST API — nothing here is sample data.
++ * Command-centre HUD around the orb.
++ *
++ *   top      brand + clock · agent switch (Claude Code / Codex)
++ *   left     conversations · subscription gauges · Claude Code today · sessions · runs
++ *   centre   rotating rings around the orb · the "reactor" microphone control · live caption
++ *   bottom   live sessions · system status · voice language
++ *   anywhere quiet toasts instead of red error text
++ *
++ * Every number comes from the JARVIS REST API. When the voice brain has not measured the
++ * subscription yet, the Claude Code panel still shows real usage read from the CLI's own
++ * transcripts (/api/usage/sessions), and the sessions list falls back to recently active
++ * conversations (/api/chats) — so it is never empty just because one source is.
 + */
 +
 +import "./hud.css";
 +import { VOICE_LANGS, getVoiceLang } from "./voice";
++import { el, svgIcon } from "./chat";
 +
-+interface LimitWindow {
-+  key: string;
-+  label: string;
-+  utilization: number | null;
-+  resets_at: number | null;
++interface LimitWindow { key: string; utilization: number | null; resets_at: number | null }
++interface SessionRow { session_id: string; project?: string; state?: string; needs_a_human_hand?: boolean; title?: string | null; summary?: string | null }
++interface RunRow { status?: string; prompt?: string; project?: string }
++interface Tokens { input: number; output: number; cache_read: number; cache_creation: number; total: number }
++interface UsageScan {
++  measured?: boolean;
++  today?: Tokens;
++  session_count?: number;
++  project_count?: number;
++  daily?: { day: string; tokens: Tokens }[];
++  models?: { model: string; tokens: Tokens }[];
 +}
-+interface SessionRow {
-+  session_id: string;
-+  project?: string;
-+  state?: string;
-+  needs_a_human_hand?: boolean;
-+}
-+interface RunRow {
-+  run_id?: string;
-+  id?: string;
-+  status?: string;
-+  prompt?: string;
-+  project?: string;
-+}
++interface ChatRow { session_id: string; project: string; title: string; updated: number; messages: number }
 +
-+function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
-+  const n = document.createElement(tag);
-+  if (cls) n.className = cls;
-+  if (text !== undefined) n.textContent = text;
-+  return n;
-+}
++export interface AgentInfo { id: string; name: string; installed: boolean; logged_in: boolean; version: string; hint: string }
++export type TalkState = "muted" | "idle" | "listening" | "thinking" | "speaking" | "compacting";
++export type MicHealth = "ok" | "silent" | "blocked" | "unsupported";
 +
 +async function getJson<T>(url: string): Promise<T | null> {
 +  try {
@@ -1568,86 +1983,182 @@ index 0000000..83ea0f1
 +function fmtReset(epoch: number | null): string {
 +  if (!epoch) return "";
 +  const mins = Math.max(0, Math.round((epoch * 1000 - Date.now()) / 60000));
-+  if (mins < 90) return `reinicia en ${mins} min`;
++  if (mins < 90) return `reinicio · ${mins} min`;
 +  const h = Math.round(mins / 60);
-+  return h < 48 ? `reinicia en ${h} h` : `reinicia en ${Math.round(h / 24)} d`;
++  return h < 48 ? `reinicio · ${h} h` : `reinicio · ${Math.round(h / 24)} d`;
 +}
 +
-+function fmtTokens(n: number): string {
-+  return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
++export function fmtTokens(n: number): string {
++  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
++  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
++  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
++  return String(n);
 +}
 +
-+export type TalkState = "muted" | "idle" | "listening" | "thinking" | "speaking" | "compacting";
++function ago(epochSec: number): string {
++  const s = Math.max(0, Math.round(Date.now() / 1000 - epochSec));
++  if (s < 60) return "ahora";
++  if (s < 3600) return `${Math.round(s / 60)} min`;
++  if (s < 86400) return `${Math.round(s / 3600)} h`;
++  return `${Math.round(s / 86400)} d`;
++}
 +
-+const TALK_LABEL: Record<TalkState, string> = {
-+  muted: "Micrófono apagado · pulsa para hablar",
-+  idle: "Hablar",
-+  listening: "Escuchando…",
-+  thinking: "Pensando…",
-+  speaking: "JARVIS habla…",
-+  compacting: "Reorganizando memoria…",
-+};
++const SVGNS = "http://www.w3.org/2000/svg";
++function svg<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number>): SVGElementTagNameMap[K] {
++  const n = document.createElementNS(SVGNS, tag);
++  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
++  return n;
++}
 +
-+export interface AgentInfo { id: string; name: string; installed: boolean; logged_in: boolean; version: string; hint: string }
++/** A ring gauge: `value` 0..100 drawn as an arc. */
++function gauge(label: string): { root: HTMLElement; set(v: number | null, big: string, sub: string): void } {
++  const root = el("div", "hud-gauge");
++  const s = svg("svg", { viewBox: "0 0 100 100", class: "hud-gauge-svg" });
++  const r = 42;
++  const c = 2 * Math.PI * r;
++  s.append(
++    svg("circle", { cx: 50, cy: 50, r, class: "hud-gauge-track", "stroke-dasharray": `${c * 0.75} ${c}`, transform: "rotate(135 50 50)" }),
++  );
++  const arc = svg("circle", { cx: 50, cy: 50, r, class: "hud-gauge-arc", "stroke-dasharray": `0 ${c}`, transform: "rotate(135 50 50)" });
++  s.append(arc);
++  const big = el("div", "hud-gauge-big", "—");
++  const lab = el("div", "hud-gauge-label", label);
++  const sub = el("div", "hud-gauge-sub", "");
++  const mid = el("div", "hud-gauge-mid");
++  mid.append(big, lab);
++  root.append(s, mid, sub);
++  return {
++    root,
++    set(v, bigText, subText) {
++      const pct = v == null ? 0 : Math.max(0, Math.min(100, v));
++      arc.setAttribute("stroke-dasharray", `${(c * 0.75 * pct) / 100} ${c}`);
++      root.classList.toggle("hot", pct >= 85);
++      root.classList.toggle("empty", v == null);
++      big.textContent = bigText;
++      sub.textContent = subText;
++    },
++  };
++}
 +
 +export function createHud(opts: { onTalk(): void; onChats(): void; onLang(code: string): void; onAgent(id: string): void }) {
 +  // ── top-left: brand + clock ──────────────────────────────────────────────
 +  const brand = el("div", "hud-brand");
-+  const title = el("div", "hud-title");
-+  title.append("JARVIS", el("small", "", " / V2"));
-+  const tag = el("div", "hud-tag", "TU CENTRO DE MANDO");
++  const word = el("div", "hud-word");
++  word.append("J.A.R.V.I.S", el("small", "", "v2"));
++  const tag = el("div", "hud-tag", "CENTRO DE MANDO");
 +  const clock = el("div", "hud-clock");
 +  const date = el("div", "hud-date");
-+  brand.append(title, tag, clock, date);
++  brand.append(word, tag, clock, date);
 +
-+  // ── top-centre: mode switch ──────────────────────────────────────────────
++  // ── top-centre: agent switch ─────────────────────────────────────────────
 +  const modes = el("div", "hud-modes");
++  const slider = el("span", "hud-mode-slider");
++  modes.append(slider);
 +  const modeBtns: Record<string, HTMLButtonElement> = {};
-+  for (const [id, label] of [["claude", "Claude Code"], ["codex", "Codex"]] as const) {
++  for (const [id, label, sub] of [["claude", "CLAUDE CODE", "Anthropic"], ["codex", "CODEX", "OpenAI"]] as const) {
 +    const b = el("button", "hud-mode");
 +    b.type = "button";
-+    b.append(el("span", "hud-mode-dot"), document.createTextNode(label));
++    b.dataset.id = id;
++    const txt = el("span", "hud-mode-txt");
++    txt.append(el("span", "hud-mode-name", label), el("span", "hud-mode-sub", sub));
++    b.append(el("span", "hud-mode-dot"), txt);
 +    b.addEventListener("click", () => opts.onAgent(id));
 +    modeBtns[id] = b;
 +    modes.append(b);
 +  }
 +
-+  // ── left: vitals ─────────────────────────────────────────────────────────
++  // ── left column ──────────────────────────────────────────────────────────
 +  const left = el("aside", "hud-left");
-+  const chatsBtn = el("button", "hud-chats");
++  const chatsBtn = el("button", "hud-convos");
 +  chatsBtn.type = "button";
-+  chatsBtn.append(el("span", "hud-chats-title", "Todas mis conversaciones"), el("span", "hud-chats-sub", "Historial de Claude Code · Ctrl+K"));
++  const cIcon = el("span", "hud-convos-icon");
++  cIcon.append(svgIcon("M4 5h16v11H8l-4 4z", 1.6, 18));
++  const cTxt = el("span", "hud-convos-txt");
++  const cCount = el("span", "hud-convos-count", "—");
++  cTxt.append(el("span", "hud-convos-title", "Todas mis conversaciones"), el("span", "hud-convos-sub", "Historial de Claude Code · Ctrl+K"));
++  chatsBtn.append(cIcon, cTxt, cCount);
 +  chatsBtn.addEventListener("click", opts.onChats);
-+  left.append(chatsBtn, el("div", "hud-h", "SIGNOS VITALES"));
-+  const cards = el("div", "hud-cards");
-+  left.append(cards);
-+  left.append(el("div", "hud-h hud-h2", "ÚLTIMAS EJECUCIONES"));
-+  const runsList = el("div", "hud-runs");
-+  left.append(runsList);
 +
-+  function card(label: string, value: string, sub: string, pct: number | null): HTMLElement {
-+    const c = el("div", "hud-card");
-+    c.append(el("div", "hud-card-label", label), el("div", "hud-card-value", value));
-+    if (pct !== null) {
-+      const bar = el("div", "hud-bar");
-+      const fill = el("i");
-+      fill.style.width = Math.min(100, Math.max(0, pct)) + "%";
-+      if (pct >= 85) fill.classList.add("hot");
-+      bar.append(fill);
-+      c.append(bar);
-+    }
-+    c.append(el("div", "hud-card-sub", sub));
-+    return c;
++  const secSub = el("section", "hud-sec");
++  secSub.append(el("h3", "hud-h", "SUSCRIPCIÓN CLAUDE"));
++  const gauges = el("div", "hud-gauges");
++  const g5 = gauge("SESIÓN 5 H");
++  const g7 = gauge("SEMANA");
++  gauges.append(g5.root, g7.root);
++  const subNote = el("div", "hud-note");
++  secSub.append(gauges, subNote);
++
++  const secToday = el("section", "hud-sec");
++  secToday.append(el("h3", "hud-h", "CLAUDE CODE · HOY"));
++  const todayBig = el("div", "hud-big", "—");
++  const todayLab = el("div", "hud-big-label", "tokens procesados");
++  const todayStats = el("div", "hud-stats");
++  const spark = svg("svg", { viewBox: "0 0 100 24", preserveAspectRatio: "none", class: "hud-spark" });
++  const models = el("div", "hud-models");
++  secToday.append(todayBig, todayLab, todayStats, spark, models);
++
++  const secSess = el("section", "hud-sec");
++  const sessHead = el("h3", "hud-h", "SESIONES");
++  const sessList = el("div", "hud-list");
++  secSess.append(sessHead, sessList);
++
++  const secRuns = el("section", "hud-sec");
++  secRuns.append(el("h3", "hud-h", "EJECUCIONES DE JARVIS"));
++  const runsList = el("div", "hud-list");
++  secRuns.append(runsList);
++
++  left.append(chatsBtn, secSub, secToday, secSess, secRuns);
++
++  // ── centre: rings, reactor, caption ─────────────────────────────────────
++  const stage = el("div", "hud-stage");
++  const rings = svg("svg", { viewBox: "-100 -100 200 200", class: "hud-rings" });
++  const ticks = svg("g", { class: "ring ring-ticks" });
++  for (let i = 0; i < 72; i++) {
++    const a = (i / 72) * Math.PI * 2;
++    const r1 = 96, r2 = i % 6 === 0 ? 91 : 93.5;
++    ticks.append(svg("line", { x1: Math.cos(a) * r1, y1: Math.sin(a) * r1, x2: Math.cos(a) * r2, y2: Math.sin(a) * r2 }));
 +  }
++  const segA = svg("circle", { r: 88, class: "ring ring-seg" });
++  const segB = svg("circle", { r: 84, class: "ring ring-dash" });
++  const level = svg("circle", { r: 80, class: "ring ring-level", pathLength: 100, "stroke-dasharray": "0 100" });
++  const arcs = svg("g", { class: "ring ring-arcs" });
++  for (let i = 0; i < 3; i++) {
++    arcs.append(svg("path", { d: describeArc(0, 0, 99, i * 120 + 10, i * 120 + 70) }));
++  }
++  rings.append(ticks, arcs, segA, segB, level);
++  stage.append(rings);
 +
-+  // ── bottom: terminals bar ────────────────────────────────────────────────
-+  const bar = el("div", "hud-bottom");
-+  const termLabel = el("div", "hud-term-label", "TERMINALES");
-+  const termCount = el("span", "hud-term-count", "0 abiertas");
-+  termLabel.append(termCount);
-+  const chipsWrap = el("div", "hud-term-chips");
++  const reactor = el("button", "hud-reactor");
++  reactor.type = "button";
++  reactor.title = "Micrófono: pulsa para silenciar / activar";
++  const rCore = el("span", "hud-reactor-core");
++  rCore.append(svgIcon("M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM19 11a7 7 0 0 1-14 0M12 18v3", 1.7, 26));
++  const rBars = el("span", "hud-reactor-bars");
++  const barEls: HTMLElement[] = [];
++  for (let i = 0; i < 24; i++) {
++    const b = el("i");
++    b.style.setProperty("--a", `${(i / 24) * 360}deg`);
++    barEls.push(b);
++    rBars.append(b);
++  }
++  reactor.append(rBars, rCore);
++  reactor.addEventListener("click", opts.onTalk);
++  const rLabel = el("div", "hud-reactor-label", "INICIANDO");
++  const rSub = el("div", "hud-reactor-sub", "");
++  const heard = el("div", "hud-heard");
++  const reactorWrap = el("div", "hud-reactor-wrap");
++  reactorWrap.append(heard, reactor, rLabel, rSub);
++
++  // ── bottom bar ───────────────────────────────────────────────────────────
++  const bar = el("footer", "hud-bottom");
++  const chipsWrap = el("div", "hud-chips");
++  const sys = el("div", "hud-sys");
++  const sysCore = el("span", "hud-sys-item", "NÚCLEO");
++  const sysVoice = el("span", "hud-sys-item", "VOZ");
++  const sysLink = el("span", "hud-sys-item", "ENLACE");
++  sys.append(sysCore, sysVoice, sysLink);
 +  const lang = el("select", "hud-lang");
-+  lang.title = "Idioma en el que hablas (el reconocimiento de voz depende de él)";
++  lang.title = "Idioma en el que hablas";
 +  for (const l of VOICE_LANGS) {
 +    const o = el("option", "", l.label);
 +    o.value = l.code;
@@ -1655,107 +2166,138 @@ index 0000000..83ea0f1
 +  }
 +  lang.value = getVoiceLang();
 +  lang.addEventListener("change", () => opts.onLang(lang.value));
++  bar.append(el("span", "hud-bottom-label", "SESIONES"), chipsWrap, sys, lang);
 +
-+  const talk = el("button", "hud-talk");
-+  talk.type = "button";
-+  const bars = el("span", "hud-bars");
-+  const barEls: HTMLElement[] = [];
-+  for (let i = 0; i < 5; i++) {
-+    const b = el("i");
-+    barEls.push(b);
-+    bars.append(b);
-+  }
-+  const talkLabel = el("span", "hud-talk-label", TALK_LABEL.idle);
-+  talk.append(bars, talkLabel);
-+  talk.dataset.state = "idle";
-+  talk.addEventListener("click", opts.onTalk);
-+  bar.append(termLabel, chipsWrap, lang, talk);
++  // ── toasts ───────────────────────────────────────────────────────────────
++  const toasts = el("div", "hud-toasts");
++  const recentToasts = new Map<string, number>();
 +
-+  // What the recogniser is hearing right now — the quickest way to tell "it can't hear me"
-+  // from "it heard me wrong".
-+  const heard = el("div", "hud-heard");
-+  let heardTimer = 0;
++  document.body.append(brand, modes, left, stage, reactorWrap, bar, toasts);
 +
-+  document.body.append(brand, modes, left, bar, heard);
-+
-+  // ── refresh ──────────────────────────────────────────────────────────────
++  // ── clock ────────────────────────────────────────────────────────────────
 +  function tickClock() {
 +    const d = new Date();
-+    clock.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-+    date.textContent = d.toLocaleDateString([], { weekday: "short", day: "2-digit", month: "short" }).toUpperCase();
++    clock.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
++    date.textContent = d.toLocaleDateString([], { weekday: "long", day: "2-digit", month: "long" }).toUpperCase();
 +  }
 +  tickClock();
 +  setInterval(tickClock, 1000);
 +
++  // ── data ─────────────────────────────────────────────────────────────────
++  function row(dotClass: string, text: string, meta: string, title = ""): HTMLElement {
++    const r = el("div", "hud-row");
++    if (title) r.title = title;
++    r.append(el("span", "hud-dot " + dotClass), el("span", "hud-row-text", text), el("span", "hud-row-meta", meta));
++    return r;
++  }
++
++  function drawSpark(daily: { day: string; tokens: Tokens }[]) {
++    spark.replaceChildren();
++    const pts = daily.slice(-14).map((d) => d.tokens.total);
++    if (pts.length < 2) {
++      spark.append(svg("line", { x1: 0, y1: 22, x2: 100, y2: 22, class: "hud-spark-line" }));
++      return;
++    }
++    const max = Math.max(...pts, 1);
++    const coords = pts.map((v, i) => `${(i / (pts.length - 1)) * 100},${22 - (v / max) * 20}`);
++    spark.append(
++      svg("polyline", { points: `0,24 ${coords.join(" ")} 100,24`, class: "hud-spark-fill" }),
++      svg("polyline", { points: coords.join(" "), class: "hud-spark-line" }),
++    );
++  }
++
 +  async function refresh() {
-+    const [limits, stats, sessions, runs] = await Promise.all([
++    const [limits, stats, sessions, runs, scan, chats] = await Promise.all([
 +      getJson<{ measured?: boolean; windows?: LimitWindow[] }>("/api/usage/limits"),
-+      getJson<{ total_runs: number; total_input_tokens: number; total_output_tokens: number; by_status: Record<string, number> }>("/api/runs/stats"),
++      getJson<{ total_runs: number; by_status: Record<string, number> }>("/api/runs/stats"),
 +      getJson<{ sessions: SessionRow[] }>("/api/sessions"),
 +      getJson<{ runs: RunRow[] }>("/api/runs?limit=4"),
++      getJson<UsageScan>("/api/usage/sessions"),
++      getJson<{ chats: ChatRow[] }>("/api/chats?limit=60"),
 +    ]);
 +
-+    cards.replaceChildren();
++    // Subscription gauges (measured by the voice brain on its first turn).
 +    const w = (k: string) => limits?.windows?.find((x) => x.key === k);
 +    const five = w("five_hour");
 +    const seven = w("seven_day");
-+    if (five?.utilization != null) cards.append(card("SESIÓN · 5 H", Math.round(five.utilization) + "%", fmtReset(five.resets_at), five.utilization));
-+    if (seven?.utilization != null) cards.append(card("SEMANA · 7 D", Math.round(seven.utilization) + "%", fmtReset(seven.resets_at), seven.utilization));
-+    if (!five && !seven) cards.append(card("SUSCRIPCIÓN", "—", "sin medir todavía", null));
-+    if (stats) {
-+      const tok = stats.total_input_tokens + stats.total_output_tokens;
-+      const failed = (stats.by_status.failed ?? 0) + (stats.by_status.timed_out ?? 0);
-+      cards.append(card("HOY · EJECUCIONES", String(stats.total_runs), `${fmtTokens(tok)} tokens · ${failed} fallidas`, null));
++    g5.set(five?.utilization ?? null, five?.utilization != null ? `${Math.round(five.utilization)}%` : "—", fmtReset(five?.resets_at ?? null));
++    g7.set(seven?.utilization ?? null, seven?.utilization != null ? `${Math.round(seven.utilization)}%` : "—", fmtReset(seven?.resets_at ?? null));
++    subNote.textContent = five?.utilization != null || seven?.utilization != null
++      ? ""
++      : "Se mide en cuanto JARVIS responde por primera vez.";
++
++    // Claude Code today, from the CLI's own transcripts.
++    const today = scan?.today;
++    todayBig.textContent = today ? fmtTokens(today.total) : "—";
++    todayStats.replaceChildren();
++    const stat = (v: string, l: string) => {
++      const s = el("div", "hud-stat");
++      s.append(el("span", "hud-stat-v", v), el("span", "hud-stat-l", l));
++      todayStats.append(s);
++    };
++    stat(today ? fmtTokens(today.output) : "—", "salida");
++    stat(String(scan?.session_count ?? "—"), "chats");
++    stat(String(scan?.project_count ?? "—"), "proyectos");
++    drawSpark(scan?.daily ?? []);
++    models.replaceChildren();
++    const ms = (scan?.models ?? []).slice(0, 3);
++    const maxM = Math.max(1, ...ms.map((m) => m.tokens.total));
++    for (const m of ms) {
++      const r = el("div", "hud-model");
++      const fill = el("i");
++      fill.style.width = `${(m.tokens.total / maxM) * 100}%`;
++      const barEl = el("span", "hud-model-bar");
++      barEl.append(fill);
++      r.append(el("span", "hud-model-name", m.model.replace(/^claude-/, "")), barEl, el("span", "hud-model-v", fmtTokens(m.tokens.total)));
++      models.append(r);
 +    }
-+    const sess = sessions?.sessions ?? [];
-+    const blocked = sess.filter((s) => s.needs_a_human_hand).length;
-+    cards.append(card("SESIONES CLAUDE CODE", String(sess.length), blocked ? `${blocked} esperando respuesta` : "ninguna bloqueada", null));
++
++    // Sessions: live ones if the watcher sees them, otherwise recently active conversations.
++    const live = sessions?.sessions ?? [];
++    const recent = (chats?.chats ?? []).filter((c) => Date.now() / 1000 - c.updated < 3 * 3600);
++    sessList.replaceChildren();
++    chipsWrap.replaceChildren();
++    if (live.length) {
++      sessHead.textContent = `SESIONES EN VIVO · ${live.length}`;
++      for (const s of live.slice(0, 5)) {
++        const needs = !!s.needs_a_human_hand;
++        sessList.append(row(needs ? "alert" : s.state === "working" ? "busy" : "idle", s.project ?? "sesión",
++          needs ? "te espera" : s.state === "working" ? "trabajando" : "en espera", s.summary ?? ""));
++        const chip = el("span", "hud-chip" + (needs ? " alert" : ""));
++        chip.append(el("span", "hud-dot " + (needs ? "alert" : s.state === "working" ? "busy" : "idle")), s.project ?? "sesión");
++        chipsWrap.append(chip);
++      }
++    } else {
++      sessHead.textContent = recent.length ? `ACTIVIDAD RECIENTE · ${recent.length}` : "SESIONES";
++      for (const c of recent.slice(0, 5)) {
++        const hot = Date.now() / 1000 - c.updated < 300;
++        sessList.append(row(hot ? "busy" : "idle", c.title, ago(c.updated), `${c.project} · ${c.messages} mensajes`));
++      }
++      for (const c of recent.slice(0, 6)) {
++        const chip = el("span", "hud-chip");
++        chip.append(el("span", "hud-dot " + (Date.now() / 1000 - c.updated < 300 ? "busy" : "idle")), c.project);
++        chip.title = c.title;
++        chipsWrap.append(chip);
++      }
++      if (!recent.length) sessList.append(el("div", "hud-empty", "Sin actividad de Claude Code en las últimas horas."));
++    }
++    if (!chipsWrap.childElementCount) chipsWrap.append(el("span", "hud-chip dim", "ninguna activa"));
++    cCount.textContent = String(chats?.chats?.length ?? "—");
 +
 +    runsList.replaceChildren();
 +    const rs = runs?.runs ?? [];
-+    if (!rs.length) runsList.append(el("div", "hud-empty", "Aún no hay ejecuciones. Pídele a JARVIS que construya algo."));
++    if (!rs.length) runsList.append(el("div", "hud-empty", `Sin ejecuciones hoy${stats ? "" : ""}. Pídele a JARVIS que construya algo.`));
 +    for (const r of rs) {
-+      const row = el("div", "hud-run");
 +      const st = r.status ?? "queued";
-+      const dot = el("span", "hud-dot " + st);
-+      row.append(dot, el("span", "hud-run-text", (r.prompt ?? r.project ?? "ejecución").slice(0, 60)));
-+      runsList.append(row);
-+    }
-+
-+    termCount.textContent = ` · ${sess.length} ${sess.length === 1 ? "abierta" : "abiertas"}`;
-+    chipsWrap.replaceChildren();
-+    for (const s of sess) {
-+      const chip = el("span", "hud-term-chip" + (s.needs_a_human_hand ? " needs" : ""));
-+      chip.append(el("span", "hud-dot " + (s.needs_a_human_hand ? "failed" : s.state === "working" ? "running" : "idle")), s.project ?? "sesión");
-+      chip.title = s.state ?? "";
-+      chipsWrap.append(chip);
++      const dot = st === "succeeded" ? "ok" : st === "failed" || st === "timed_out" ? "alert" : st === "running" ? "busy" : "idle";
++      runsList.append(row(dot, (r.prompt ?? r.project ?? "ejecución").slice(0, 60), st));
 +    }
 +  }
-+  refresh();
++  void refresh();
 +  setInterval(refresh, 15000);
 +
-+  function setTalk(state: TalkState, voiceActive: boolean, level: number) {
-+    const key = state === "listening" && voiceActive ? "hearing" : state;
-+    talk.dataset.state = key;
-+    talkLabel.textContent = key === "hearing" ? "Te oigo…" : TALK_LABEL[state];
-+    const now = performance.now();
-+    barEls.forEach((b, i) => {
-+      const wave = 0.55 + 0.45 * Math.sin(now / 110 + i * 1.4);
-+      b.style.height = (voiceActive ? 5 + level * 22 * wave : 4) + "px";
-+    });
-+  }
-+
-+  function setHeard(text: string, final: boolean) {
-+    clearTimeout(heardTimer);
-+    heard.textContent = text ? `“${text}”` : "";
-+    heard.classList.toggle("final", final);
-+    heard.classList.toggle("show", Boolean(text));
-+    heardTimer = window.setTimeout(() => heard.classList.remove("show"), final ? 3500 : 6000);
-+  }
-+
++  // ── agents ───────────────────────────────────────────────────────────────
 +  let agentInfo: AgentInfo[] = [];
-+
-+  // Green = installed and signed in; amber = installed but signed out; grey = not installed.
 +  function paintAgents(list: AgentInfo[]) {
 +    agentInfo = list;
 +    for (const a of list) {
@@ -1764,11 +2306,10 @@ index 0000000..83ea0f1
 +      const dot = b.querySelector(".hud-mode-dot") as HTMLElement;
 +      dot.className = "hud-mode-dot " + (a.installed ? (a.logged_in ? "ok" : "warn") : "off");
 +      b.title = a.installed
-+        ? (a.logged_in ? `${a.name} listo · ${a.version}` : `${a.name} instalado, falta iniciar sesión. ${a.hint}`)
++        ? (a.logged_in ? `${a.name} listo · ${a.version}` : `${a.name}: falta iniciar sesión. ${a.hint}`)
 +        : `${a.name} no está instalado. ${a.hint}`;
 +    }
 +  }
-+
 +  async function refreshAgents(): Promise<AgentInfo[]> {
 +    const data = await getJson<{ agents: AgentInfo[] }>("/api/agents");
 +    if (data) paintAgents(data.agents);
@@ -1779,15 +2320,106 @@ index 0000000..83ea0f1
 +
 +  function setAgent(id: string) {
 +    for (const [k, b] of Object.entries(modeBtns)) b.classList.toggle("active", k === id);
++    modes.dataset.active = id;
 +  }
 +
-+  return { refresh, setTalk, setHeard, setAgent, refreshAgents };
++  // ── reactor / talk state ─────────────────────────────────────────────────
++  const TALK: Record<string, [string, string]> = {
++    muted: ["MICRÓFONO APAGADO", "pulsa para activar"],
++    idle: ["EN ESPERA", ""],
++    listening: ["ESCUCHANDO", "habla cuando quieras"],
++    hearing: ["TE OIGO", "respondo al terminar"],
++    thinking: ["PROCESANDO", ""],
++    speaking: ["JARVIS HABLA", "Esc para interrumpir"],
++    compacting: ["REORGANIZANDO", "un momento"],
++  };
++  let micHealth: MicHealth = "ok";
++  let lastKey = "";
++
++  function setTalk(state: TalkState, voiceActive: boolean, lvl: number) {
++    let key: string = state === "listening" && voiceActive ? "hearing" : state;
++    let [label, sub] = TALK[key] ?? TALK.idle;
++    if (state !== "muted" && micHealth === "blocked") { key = "blocked"; label = "SIN MICRÓFONO"; sub = "permite el micro en Chrome"; }
++    else if (state === "listening" && !voiceActive && micHealth === "silent") { sub = "no llega señal del micro"; }
++    else if (micHealth === "unsupported") { key = "blocked"; label = "VOZ NO DISPONIBLE"; sub = "usa Google Chrome · o escribe"; }
++    reactor.dataset.state = key;
++    reactorWrap.dataset.state = key;
++    stage.dataset.state = key;
++    document.body.dataset.talk = key;
++    if (key !== lastKey || rLabel.textContent !== label) { rLabel.textContent = label; lastKey = key; }
++    rSub.textContent = sub;
++    const now = performance.now();
++    const shown = voiceActive ? lvl : 0;
++    barEls.forEach((b, i) => {
++      const wave = 0.5 + 0.5 * Math.sin(now / 120 + i * 0.9);
++      b.style.setProperty("--h", String(voiceActive ? 0.25 + shown * wave : 0.12));
++    });
++    level.setAttribute("stroke-dasharray", `${Math.round(shown * 100)} 100`);
++  }
++
++  function setMicHealth(h: MicHealth) {
++    micHealth = h;
++    sysVoice.dataset.state = h === "ok" ? "ok" : h === "silent" ? "warn" : "bad";
++    sysVoice.title = h === "ok" ? "Micrófono con señal" : h === "silent" ? "El micrófono no envía sonido" : "Micrófono no disponible";
++  }
++
++  function setHeard(text: string, final: boolean) {
++    heard.textContent = text;
++    heard.classList.toggle("final", final);
++    heard.classList.toggle("show", Boolean(text));
++    clearTimeout((heard as unknown as { _t?: number })._t);
++    (heard as unknown as { _t?: number })._t = window.setTimeout(() => heard.classList.remove("show"), final ? 3500 : 6000);
++  }
++
++  function setCore(state: string, detail?: string | null) {
++    sysCore.dataset.state = state === "ready" ? "ok" : state === "starting" || state === "disconnected" ? "warn" : "bad";
++    sysCore.title = detail || (state === "ready" ? "Cerebro de JARVIS en línea" : "Cerebro de JARVIS no disponible");
++  }
++
++  function setLink(ok: boolean) {
++    sysLink.dataset.state = ok ? "ok" : "bad";
++    sysLink.title = ok ? "Conectado al servidor de JARVIS" : "Sin conexión con el servidor de JARVIS";
++  }
++
++  /** Quiet notification. Repeats of the same message within 45 s are dropped. */
++  function toast(text: string, kind: "info" | "warn" = "info") {
++    const now = Date.now();
++    if ((recentToasts.get(text) ?? 0) > now - 45000) return;
++    recentToasts.set(text, now);
++    while (toasts.childElementCount >= 2) toasts.firstElementChild?.remove();
++    const t = el("div", "hud-toast " + kind);
++    t.append(el("span", "hud-toast-bar"), el("span", "hud-toast-text", text));
++    toasts.append(t);
++    requestAnimationFrame(() => t.classList.add("show"));
++    setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 400); }, 4200);
++  }
++
++  /** Centre of the free area between the side panels (the orb sits there too). */
++  function layout(centerX: number) {
++    document.documentElement.style.setProperty("--stage-x", `${centerX}px`);
++  }
++
++  return { refresh, setTalk, setHeard, setAgent, refreshAgents, setCore, setLink, setMicHealth, toast, layout };
++}
++
++function describeArc(cx: number, cy: number, r: number, a0: number, a1: number): string {
++  const p = (a: number) => [cx + r * Math.cos((a * Math.PI) / 180), cy + r * Math.sin((a * Math.PI) / 180)];
++  const [x0, y0] = p(a0);
++  const [x1, y1] = p(a1);
++  return `M ${x0} ${y0} A ${r} ${r} 0 ${a1 - a0 > 180 ? 1 : 0} 1 ${x1} ${y1}`;
 +}
 diff --git a/frontend/src/main.ts b/frontend/src/main.ts
-index 9c26565..cbe448b 100644
+index 9c26565..0401689 100644
 --- a/frontend/src/main.ts
 +++ b/frontend/src/main.ts
-@@ -6,9 +6,12 @@
+@@ -1,56 +1,45 @@
+ /**
+  * JARVIS — Main entry point.
+  *
+- * Wires together the orb visualization, WebSocket communication,
+- * speech recognition, and audio playback into a single experience.
++ * Wires together the orb, the voice WebSocket, speech recognition, audio playback, the chat
++ * panel, the command-centre HUD and the conversations browser.
   */
  
  import { createOrb, type OrbState } from "./orb";
@@ -1795,35 +2427,96 @@ index 9c26565..cbe448b 100644
 +import { createVoiceInput, createAudioPlayer, createMicMonitor, setVoiceLang } from "./voice";
  import { createSocket } from "./ws";
  import { openSettings, checkFirstTimeSetup } from "./settings";
-+import { createChat } from "./chat";
-+import { createHud, type AgentInfo } from "./hud";
++import { createChat, type CoreState } from "./chat";
++import { createHud, type AgentInfo, type MicHealth } from "./hud";
 +import { createChats } from "./chats";
  import "./style.css";
  
- // ---------------------------------------------------------------------------
-@@ -33,8 +36,8 @@ function showError(msg: string) {
- function updateStatus(state: State) {
-   const labels: Record<State, string> = {
-     idle: "",
+-// ---------------------------------------------------------------------------
+-// State machine
+-// ---------------------------------------------------------------------------
+-
+ type State = "idle" | "listening" | "thinking" | "speaking" | "compacting";
+ let currentState: State = "idle";
+ let isMuted = false;
+ 
+-const statusEl = document.getElementById("status-text")!;
+-const errorEl = document.getElementById("error-text")!;
+-
+-function showError(msg: string) {
+-  errorEl.textContent = msg;
+-  errorEl.style.opacity = "1";
+-  setTimeout(() => {
+-    errorEl.style.opacity = "0";
+-  }, 5000);
+-}
+-
+-function updateStatus(state: State) {
+-  const labels: Record<State, string> = {
+-    idle: "",
 -    listening: "listening...",
 -    thinking: "thinking...",
-+    listening: "",           // the talk button carries these now
-+    thinking: "",
-     speaking: "",
-     compacting: "",          // the notice banner carries the words; the orb carries the state
-   };
-@@ -63,6 +66,8 @@ function transition(newState: State) {
-   const btn = document.getElementById("hush");
-   if (btn) (btn as HTMLButtonElement).hidden = newState !== "speaking";
+-    speaking: "",
+-    compacting: "",          // the notice banner carries the words; the orb carries the state
+-  };
+-  statusEl.textContent = labels[state];
++// ---------------------------------------------------------------------------
++// Messages from the recogniser are English and technical; the user sees short Spanish toasts,
++// and anything purely diagnostic goes to the console only.
++// ---------------------------------------------------------------------------
++function friendly(msg: string): { text: string; health?: MicHealth } | null {
++  const m = msg.toLowerCase();
++  if (m.includes("not supported")) return { text: "Tu navegador no permite dictado por voz. Usa Google Chrome o escribe en el chat.", health: "unsupported" };
++  if (m.includes("microphone blocked")) return { text: "Chrome no deja usar el micrófono. Pulsa el candado de la barra de direcciones y permítelo.", health: "blocked" };
++  if (m.includes("another app")) return { text: "Otra aplicación está usando el micrófono.", health: "blocked" };
++  if (m.includes("lost its connection")) return { text: "Se perdió la conexión del dictado. Repite la frase." };
++  if (m.includes("stalled")) return null;       // recovered automatically; nothing for the user to do
++  return null;
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// Init components
++// Components
+ // ---------------------------------------------------------------------------
+-
+ const canvas = document.getElementById("orb-canvas") as HTMLCanvasElement;
+ const orb = createOrb(canvas);
+ 
+ const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+-const WS_URL = `${wsProto}//${window.location.host}/ws/voice`;
+-const socket = createSocket(WS_URL);
++const socket = createSocket(`${wsProto}//${window.location.host}/ws/voice`);
+ 
+ const audioPlayer = createAudioPlayer();
+ orb.setAnalyser(audioPlayer.getAnalyser());
+@@ -60,112 +49,289 @@ let muteMicDuringSpeech = false;
+ function transition(newState: State) {
+   if (newState === currentState) return;
+   currentState = newState;
+-  const btn = document.getElementById("hush");
+-  if (btn) (btn as HTMLButtonElement).hidden = newState !== "speaking";
    orb.setState(newState as OrbState);
+-  updateStatus(newState);
+-
 +  chat.setState(newState);
 +  hud.setTalk(talkState(), voiceActive, 0);
-   updateStatus(newState);
- 
    if (isMuted) return;
-@@ -81,11 +86,14 @@ const voiceInput = createVoiceInput(
+-  if (newState === "speaking" && muteMicDuringSpeech) {
+-    voiceInput.pause();
+-  } else {
+-    voiceInput.resume();
+-  }
++  if (newState === "speaking" && muteMicDuringSpeech) voiceInput.pause();
++  else voiceInput.resume();
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Voice input
+ // ---------------------------------------------------------------------------
+-
+ const voiceInput = createVoiceInput(
    (text: string) => {
-     // The server decides whether this is echo, a barge-in, or a new turn.
+-    // The server decides whether this is echo, a barge-in, or a new turn.
      micMonitor.sawSpeech();
 -    socket.send({ type: "transcript", text, isFinal: true });
 +    chat.addUser(text, true);
@@ -1837,81 +2530,134 @@ index 9c26565..cbe448b 100644
 +    if (agent === "claude") socket.send({ type: "interim", text });
    },
    (msg: string) => {
-     showError(msg);
-@@ -111,16 +119,61 @@ const micMonitor = createMicMonitor(
-     const pct = Math.min(100, Math.round(level * 900));
-     micDot.style.setProperty("--level", `${pct}%`);
-     micDot.classList.toggle("is-hot", level > 0.02);
-+    onMicLevel(level);
+-    showError(msg);
++    console.info("[voice]", msg);
++    const f = friendly(msg);
++    if (!f) return;
++    if (f.health) setMicHealth(f.health);
++    hud.toast(f.text, "warn");
    },
-   (event: string) => {
-     socket.send({ type: "mic", text: event });
-     // Proven deaf: sound going in, nothing coming out. Do not wait for the
-     // rotation timer to happen along — measured once at 21 seconds, all of
-     // it lost. Rebuild the recogniser now.
--    if (event.startsWith("DEAF")) voiceInput.restart("deaf: audio in, no results");
-+    if (event.startsWith("DEAF")) {
-+      voiceInput.restart("deaf: audio in, no results");
-+      if (Date.now() - deafShownAt > 30000) {
-+        deafShownAt = Date.now();
-+        showError("Oigo sonido pero el reconocimiento no devuelve texto. Revisa: internet, el idioma del selector y que uses Chrome.");
-+      }
-+    }
-   }
+-  (event: string) => {
+-    // Mirror the recogniser's lifecycle to the server log. Going deaf is a
+-    // browser-side failure the server cannot otherwise see at all, and the
+-    // console it used to be confined to is never open when it happens.
+-    socket.send({ type: "mic", text: event });
+-  }
++  (event: string) => socket.send({ type: "mic", text: event }),
  );
  
-+// ── the user's own voice: drives the orb and the talk button ─────────────────
-+// Normalised against a noise floor, with hysteresis so the "hearing you" state neither
-+// flickers on breaths nor lingers after you stop. While JARVIS is talking (or the mic is
-+// muted) the level is forced to zero: his own voice comes back through the microphone.
-+let deafShownAt = 0;
+-// A live meter for the microphone itself. If this moves when you speak, the
+-// microphone is working — whatever else is or is not happening. It answers
+-// "is it even hearing me?" without a log, a console or anyone to ask.
+-const micDot = document.createElement("div");
+-micDot.id = "mic-level";
+-micDot.title = "microphone input";
+-document.body.appendChild(micDot);
+-
+ const micMonitor = createMicMonitor(
+-  (level: number) => {
+-    const pct = Math.min(100, Math.round(level * 900));
+-    micDot.style.setProperty("--level", `${pct}%`);
+-    micDot.classList.toggle("is-hot", level > 0.02);
+-  },
++  (level: number) => onMicLevel(level),
+   (event: string) => {
+     socket.send({ type: "mic", text: event });
+-    // Proven deaf: sound going in, nothing coming out. Do not wait for the
+-    // rotation timer to happen along — measured once at 21 seconds, all of
+-    // it lost. Rebuild the recogniser now.
+     if (event.startsWith("DEAF")) voiceInput.restart("deaf: audio in, no results");
+-  }
++    if (event.startsWith("mic monitor could not open")) setMicHealth("blocked");
++  },
+ );
+ 
+-// ── stopping him ──────────────────────────────────────────────────────────
+-// Escape, or the button that appears while he is talking. Not a spoken word:
+-// his voice comes back through the microphone garbled, and a mis-hear that
+-// looked like "stop" would cut him off at random. A keystroke cannot be
+-// misheard.
+-const hushBtn = document.createElement("button");
+-hushBtn.id = "hush";
+-hushBtn.type = "button";
+-hushBtn.textContent = "Stop";
+-hushBtn.title = "Stop speaking (Esc)";
+-hushBtn.hidden = true;
+-document.body.appendChild(hushBtn);
++// ── the user's own voice: drives the orb, the rings and the reactor ─────────
 +let voiceActive = false;
-+let voiceOnAt = 0;
 +let lastLoudAt = 0;
 +let lastSoundAt = Date.now();
-+let noSoundWarnedAt = 0;
++let micHealth: MicHealth = "ok";
 +const micStartedAt = Date.now();
++
++function setMicHealth(h: MicHealth) {
++  micHealth = h;
++  hud.setMicHealth(h);
++}
 +
 +function talkState(): "muted" | State {
 +  return isMuted ? "muted" : currentState;
 +}
-+
+ 
 +function onMicLevel(rms: number) {
 +  const now = Date.now();
-+  const heardSound = rms > 0.006;
-+  if (heardSound) lastSoundAt = now;
++  if (rms > 0.006) {
++    lastSoundAt = now;
++    if (micHealth === "silent" || micHealth === "blocked") setMicHealth("ok");
++  }
 +  const blocked = isMuted || currentState === "speaking" || currentState === "thinking";
 +  const norm = blocked ? 0 : Math.max(0, Math.min(1, (rms - 0.012) / 0.09));
 +  if (norm > 0.12) {
 +    lastLoudAt = now;
-+    if (!voiceActive) { voiceActive = true; voiceOnAt = now; }
++    voiceActive = true;
 +  } else if (voiceActive && now - lastLoudAt > 600) {
 +    voiceActive = false;
 +  }
 +  orb.setVoiceLevel(voiceActive ? Math.max(norm, 0.2) : 0);
 +  hud.setTalk(talkState(), voiceActive, norm);
-+
-+  // Nothing at all reaching the browser: say so instead of leaving the user guessing.
-+  if (!isMuted && now - micStartedAt > 10000 && now - lastSoundAt > 10000 && now - noSoundWarnedAt > 60000) {
-+    noSoundWarnedAt = now;
-+    showError("No detecto sonido del micrófono. Comprueba el dispositivo de entrada de Windows y el permiso de Chrome.");
-+  }
++  // No sound at all for a while: show it on the reactor itself instead of a red sentence.
++  if (!isMuted && micHealth === "ok" && now - micStartedAt > 12000 && now - lastSoundAt > 12000) setMicHealth("silent");
 +}
 +
- // ── stopping him ──────────────────────────────────────────────────────────
- // Escape, or the button that appears while he is talking. Not a spoken word:
- // his voice comes back through the microphone garbled, and a mis-hear that
-@@ -142,6 +195,110 @@ function hush() {
++// ── stopping him (Esc or the Stop control while he talks) ────────────────────
+ function hush() {
+   if (currentState !== "speaking") return;
+-  // Locally first: the round trip is real and silence should be instant.
+   audioPlayer.stop();
+   socket.send({ type: "hush" });
    transition(isMuted ? "idle" : "listening");
  }
  
-+// ── which agent answers: Claude Code (JARVIS's own brain) or Codex ─────────────────────────────
+-hushBtn.addEventListener("click", hush);
+-window.addEventListener("keydown", (e: KeyboardEvent) => {
+-  if (e.key === "Escape") { e.preventDefault(); hush(); }
++function toggleMute() {
++  isMuted = !isMuted;
++  document.getElementById("btn-mute")?.classList.toggle("muted", isMuted);
++  if (isMuted) {
++    voiceActive = false;
++    orb.setVoiceLevel(0);
++    voiceInput.pause();
++    transition("idle");
++  } else {
++    voiceInput.resume();
++    transition("listening");
++  }
++  hud.setTalk(talkState(), false, 0);
++}
++
++// ---------------------------------------------------------------------------
++// Agents: Claude Code (JARVIS's own brain) or Codex
++// ---------------------------------------------------------------------------
 +type Agent = "claude" | "codex";
 +let agent: Agent = "claude";
 +try { if (localStorage.getItem("jarvis.agent") === "codex") agent = "codex"; } catch { /* storage blocked */ }
 +const AGENT_NAME: Record<Agent, string> = { claude: "Claude Code", codex: "Codex" };
 +
-+// One Codex turn: POST, then read newline-delimited JSON events as they arrive.
++let coreState: CoreState = "starting";
++let coreDetail: string | null = null;
++
 +async function sendToCodex(text: string) {
 +  try {
 +    const r = await fetch("/api/agents/codex/exec", {
@@ -1954,86 +2700,278 @@ index 9c26565..cbe448b 100644
 +  }
 +}
 +
-+function routeToAgent(text: string) {
-+  if (agent === "codex") void sendToCodex(text);
-+  else socket.send({ type: "transcript", text, isFinal: true });
++function sendToClaude(text: string) {
++  // The socket drops frames while it is not open; say so instead of waiting forever.
++  if (!socket.isConnected()) {
++    chat.botNote("Sin conexión con el servidor de JARVIS. Reintentando… vuelve a enviarlo en unos segundos.", "error");
++    return;
++  }
++  if (coreState === "failed") {
++    chat.botNote(`El núcleo de JARVIS (Claude Code) no está en marcha${coreDetail ? `: ${coreDetail}` : "."} Pulsa REINTENTAR arriba.`, "error");
++    return;
++  }
++  if (coreState === "starting") chat.botNote("El núcleo aún está arrancando; responderá en cuanto esté listo.");
++  socket.send({ type: "transcript", text, isFinal: true });
 +}
 +
-+// Typed conversation: same wire format as a spoken final transcript.
++function routeToAgent(text: string) {
++  if (agent === "codex") void sendToCodex(text);
++  else sendToClaude(text);
++}
++
 +const chat = createChat({
 +  onSend: (text: string) => routeToAgent(text),
 +  onStop: hush,
-+});
-+
-+// Command-centre HUD: brand/clock, live vitals, terminals bar.
-+const chats = createChats({ onAskJarvis: (text: string) => chat.ask(text) });
++  onRetryCore: async () => {
++    chat.setCore("starting");
++    try { await fetch("/api/brain/restart", { method: "POST" }); } catch { /* the poll reports it */ }
++    void pollHealth();
++  },
+ });
+ 
+-audioPlayer.onPlayed((utt, idx) => {
+-  socket.send({ type: "played", utt, idx });
++const chats = createChats({
++  onAskJarvis: (text: string) => chat.ask(text),
++  getChatHistory: () => chat.history(),
++  mergeChatHistory: (items) => chat.mergeHistory(items),
+ });
+ 
+-// End of speech is the server's call (`status: idle` after every chunk is
+-// acked); a transient empty queue mid-utterance must not flip the UI.
+-audioPlayer.onFinished(() => {});
 +const hud = createHud({
-+  onTalk: () => document.getElementById("btn-mute")?.click(),
++  onTalk: toggleMute,
 +  onChats: () => chats.open(),
-+  onAgent: (id: string) => selectAgent(id === "codex" ? "codex" : "claude"),
++  onAgent: (id: string) => void selectAgent(id === "codex" ? "codex" : "claude"),
 +  onLang: (code: string) => {
 +    setVoiceLang(code);
 +    voiceInput.restart("language changed");
-+    showError(`Idioma de voz: ${code}`);
++    hud.toast(`Idioma de voz: ${code}`);
 +  },
 +});
+ 
+-audioPlayer.onNeedsGesture(() => {
+-  showError("Click anywhere to enable audio");
++function applyAgentTheme(a: Agent) {
++  document.body.dataset.agent = a;
++  orb.setPalette(a === "codex" ? 0.43 : null);   // Codex: emerald; Claude: the drifting spectrum
++  hud.setAgent(a);
++  chat.setAgent(a, AGENT_NAME[a]);
++}
 +
 +async function selectAgent(next: Agent) {
++  const changed = next !== agent;
 +  agent = next;
 +  try { localStorage.setItem("jarvis.agent", next); } catch { /* ignore */ }
-+  hud.setAgent(next);
-+  chat.setAgent(next, AGENT_NAME[next]);
++  applyAgentTheme(next);
 +  chat.toggle(true);
-+  const info: AgentInfo | undefined = (await hud.refreshAgents()).find((a) => a.id === next);
++  if (!changed) return;
++  const info: AgentInfo | undefined = (await hud.refreshAgents()).find((x) => x.id === next);
 +  if (!info) return;
 +  if (!info.installed) {
 +    chat.botNote(`${info.name} no está instalado en este ordenador. Para usarlo, ejecuta en una terminal:`, "error");
 +    chat.botNote(`\`${info.hint}\``);
 +  } else if (!info.logged_in) {
-+    chat.botNote(`${info.name} está instalado pero no tiene la sesión iniciada.`, "error");
++    chat.botNote(`${info.name} está instalado pero sin sesión iniciada.`, "error");
 +    chat.botNote(`\`${info.hint}\``);
 +  } else {
-+    chat.botNote(`Ahora respondes con ${info.name} (${info.version}). ${next === "codex" ? "Codex trabaja en modo solo lectura y en tu carpeta personal." : "Es el cerebro de voz de JARVIS."}`);
++    chat.botNote(`Canal cambiado a ${info.name} · ${info.version}`);
 +  }
 +}
-+hud.setAgent(agent);
-+chat.setAgent(agent, AGENT_NAME[agent]);
++applyAgentTheme(agent);
 +
-+// Keep the orb centred in the space left between the side panels.
++// Orb + rings stay centred in the space left between the side panels.
 +function layoutOrb() {
-+  const leftW = window.innerWidth >= 1200 ? 280 : 0;
-+  const rightW = document.body.classList.contains("chat-open") ? Math.min(440, window.innerWidth) : 0;
++  const leftW = window.innerWidth >= 1200 ? 300 : 0;
++  const rightW = document.body.classList.contains("chat-open") ? Math.min(460, window.innerWidth) : 0;
 +  orb.setCenterShift((leftW - rightW) / 2);
++  hud.layout(leftW + (window.innerWidth - leftW - rightW) / 2);
 +}
 +window.addEventListener("jarvis:layout", layoutOrb);
 +window.addEventListener("resize", layoutOrb);
 +layoutOrb();
 +
- hushBtn.addEventListener("click", hush);
- window.addEventListener("keydown", (e: KeyboardEvent) => {
-   if (e.key === "Escape") { e.preventDefault(); hush(); }
-@@ -165,6 +322,7 @@ audioPlayer.onNeedsGesture(() => {
++window.addEventListener("keydown", (e: KeyboardEvent) => {
++  if (e.key === "Escape") { e.preventDefault(); hush(); }
+ });
  
++audioPlayer.onPlayed((utt, idx) => socket.send({ type: "played", utt, idx }));
++audioPlayer.onFinished(() => {});
++audioPlayer.onNeedsGesture(() => hud.toast("Haz clic en cualquier parte para activar el sonido."));
++
+ // ---------------------------------------------------------------------------
+-// WebSocket messages
++// Brain / server health
+ // ---------------------------------------------------------------------------
++async function pollHealth() {
++  let next: CoreState;
++  let detail: string | null = null;
++  try {
++    const r = await fetch("/api/health");
++    const h = (await r.json()) as { brain?: { state: string; error: string | null; auth?: boolean } };
++    const b = h.brain;
++    next = !b ? "starting" : b.state === "ready" ? "ready" : b.state === "failed" ? "failed" : b.state === "off" ? "failed" : "starting";
++    detail = b?.auth ? "Claude Code no tiene la sesión iniciada: ejecuta `claude` en una terminal y vuelve a intentarlo." : b?.error ?? null;
++    hud.setLink(true);
++  } catch {
++    next = "offline";
++    detail = "El servidor de JARVIS no responde. ¿Sigue abierta su ventana?";
++    hud.setLink(false);
++  }
++  if (next !== "offline" && !socket.isConnected()) next = next === "ready" ? "disconnected" : next;
++  if (next !== coreState || detail !== coreDetail) {
++    if (next === "failed" && coreState !== "failed") hud.toast("El núcleo de JARVIS se ha detenido. Mira el panel del chat.", "warn");
++    coreState = next;
++    coreDetail = detail;
++    chat.setCore(next, detail);
++    hud.setCore(next, detail);
++  }
++}
++void pollHealth();
++setInterval(pollHealth, 4000);
+ 
++// ---------------------------------------------------------------------------
++// WebSocket messages
++// ---------------------------------------------------------------------------
  socket.onMessage((msg) => {
    const type = msg.type as string;
+-
 +  chat.handleMessage(msg);
- 
    if (type === "config") {
      muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
-@@ -238,6 +396,8 @@ btnMute.addEventListener("click", (e) => {
+   } else if (type === "audio") {
+@@ -174,7 +340,6 @@ socket.onMessage((msg) => {
+       if (currentState !== "speaking") transition("speaking");
+       audioPlayer.enqueue(data, Number(msg.utt), Number(msg.idx));
+     }
+-    if (msg.text) console.log("[JARVIS]", msg.text);
+   } else if (type === "stop") {
+     audioPlayer.stop();
+     transition(isMuted ? "idle" : "listening");
+@@ -186,106 +351,62 @@ socket.onMessage((msg) => {
+     else if (state === "speaking") transition("speaking");
+     else if (state === "compacting") transition("compacting");
+     else if (state === "idle") transition(isMuted ? "idle" : "listening");
+-  } else if (type === "text") {
+-    // A chunk TTS could not voice: show it instead of losing it
+-    console.log("[JARVIS]", msg.text);
+-    statusEl.textContent = String(msg.text);
+   } else if (type === "notice") {
+-    // Shown, never spoken. The server sends one when it is about to be busy
+-    // for a few seconds (a context rotation), and an empty string to clear it.
+-    // Without it the pause looks like a crash.
+     const text = String(msg.text ?? "");
+-    statusEl.textContent = text;
+-    if (text) console.log("[notice]", text);
++    if (text) hud.toast(text);
+   }
+ });
+ 
+ // ---------------------------------------------------------------------------
+ // Kick off
+ // ---------------------------------------------------------------------------
+-
+-// Start listening after a brief delay for the orb to render
+ setTimeout(() => {
+   voiceInput.start();
+   if (currentState !== "speaking") transition("listening");
+ }, 1000);
+ 
+-// Resume AudioContext on ANY user interaction (browser autoplay policy)
+ function ensureAudioContext() {
+   const ctx = audioPlayer.getAnalyser().context as AudioContext;
+-  if (ctx.state === "suspended") {
+-    ctx.resume().then(() => console.log("[audio] context resumed"));
+-  }
++  if (ctx.state === "suspended") void ctx.resume();
+ }
+ document.addEventListener("click", ensureAudioContext);
+ document.addEventListener("touchstart", ensureAudioContext);
+ document.addEventListener("keydown", ensureAudioContext, { once: true });
+-
+-// Try to resume audio context on load
+ ensureAudioContext();
+ 
+ // ---------------------------------------------------------------------------
+-// UI Controls
++// Top-right controls
+ // ---------------------------------------------------------------------------
+-
+ const btnMute = document.getElementById("btn-mute")!;
+ const btnMenu = document.getElementById("btn-menu")!;
+ const menuDropdown = document.getElementById("menu-dropdown")!;
+-const btnRestart = document.getElementById("btn-restart")!;
+-const btnFixSelf = document.getElementById("btn-fix-self")!;
+ 
+ btnMute.addEventListener("click", (e) => {
    e.stopPropagation();
-   isMuted = !isMuted;
-   btnMute.classList.toggle("muted", isMuted);
-+  if (isMuted) { voiceActive = false; orb.setVoiceLevel(0); }
-+  hud.setTalk(talkState(), false, 0);
-   if (isMuted) {
-     voiceInput.pause();
-     transition("idle");
+-  isMuted = !isMuted;
+-  btnMute.classList.toggle("muted", isMuted);
+-  if (isMuted) {
+-    voiceInput.pause();
+-    transition("idle");
+-  } else {
+-    voiceInput.resume();
+-    transition("listening");
+-  }
++  toggleMute();
+ });
+-
+ btnMenu.addEventListener("click", (e) => {
+   e.stopPropagation();
+   menuDropdown.style.display = menuDropdown.style.display === "none" ? "block" : "none";
+ });
++document.addEventListener("click", () => { menuDropdown.style.display = "none"; });
+ 
+-document.addEventListener("click", () => {
+-  menuDropdown.style.display = "none";
+-});
+-
+-btnRestart.addEventListener("click", async (e) => {
++document.getElementById("btn-restart")!.addEventListener("click", async (e) => {
+   e.stopPropagation();
+   menuDropdown.style.display = "none";
+-  statusEl.textContent = "restarting...";
++  hud.toast("Reiniciando JARVIS…");
+   try {
+     await fetch("/api/restart", { method: "POST" });
+-    // Wait a few seconds then reload
+     setTimeout(() => window.location.reload(), 4000);
+   } catch {
+-    statusEl.textContent = "restart failed";
++    hud.toast("No se pudo reiniciar.", "warn");
+   }
+ });
+-
+-btnFixSelf.addEventListener("click", (e) => {
+-  e.stopPropagation();
+-  menuDropdown.style.display = "none";
+-  // Activate work mode on the WebSocket session (JARVIS becomes Claude Code's voice)
+-  // Milestone 1 has no tools yet; "Fix yourself" returns as a brain tool later.
+-  statusEl.textContent = "fix-yourself is not available in this build";
+-});
+-
+-// Settings button
+-const btnSettings = document.getElementById("btn-settings")!;
+-btnSettings.addEventListener("click", (e) => {
++document.getElementById("btn-fix-self")?.remove();
++document.getElementById("btn-settings")!.addEventListener("click", (e) => {
+   e.stopPropagation();
+   menuDropdown.style.display = "none";
+   openSettings();
+ });
+ 
+-// First-time setup detection — check after a short delay for server readiness
+-setTimeout(() => {
+-  checkFirstTimeSetup();
+-}, 2000);
++setTimeout(() => { void checkFirstTimeSetup(); }, 2000);
 diff --git a/frontend/src/orb.ts b/frontend/src/orb.ts
-index eb0450b..dd38659 100644
+index eb0450b..bd01d7e 100644
 --- a/frontend/src/orb.ts
 +++ b/frontend/src/orb.ts
-@@ -19,10 +19,22 @@ export interface Orb {
+@@ -19,10 +19,25 @@ export interface Orb {
    setState(s: OrbState): void;
    setAnalyser(a: AnalyserNode | null): void;
    destroy(): void;
@@ -2043,6 +2981,8 @@ index eb0450b..dd38659 100644
 +  setVoiceLevel(level: number): void;
 +  /** Current hue in degrees (0..360), so the UI can borrow the orb's colour. */
 +  getHue(): number;
++  /** Lock the colour near one hue (0..1), or null to let it drift around the wheel. */
++  setPalette(hue: number | null): void;
  }
  
  export function createOrb(canvas: HTMLCanvasElement): Orb {
@@ -2052,11 +2992,12 @@ index eb0450b..dd38659 100644
 +  let voiceTarget = 0;   // raw input, 0..1
 +  let voice = 0;         // smoothed: fast attack, slower release, so it stops when you stop
 +  let hue = 0.55;
++  let paletteHue: number | null = null;
 +  const tint = new THREE.Color();
    const N = 2000;
  
    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-@@ -122,6 +134,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -122,6 +137,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
    let freqData = new Uint8Array(64);
    let bass = 0, mid = 0;
  
@@ -2064,7 +3005,7 @@ index eb0450b..dd38659 100644
    const clock = new THREE.Clock();
  
    function animate() {
-@@ -129,6 +142,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -129,6 +145,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
      requestAnimationFrame(animate);
      const t = clock.getElapsedTime();
  
@@ -2075,7 +3016,7 @@ index eb0450b..dd38659 100644
      switch (state) {
        case "idle":
          targetRadius = 28; targetSpeed = 0.2; targetBright = 0.5; targetSize = 0.35;
-@@ -149,7 +166,16 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -149,7 +169,16 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
          targetLineAmount = 0.0; targetElectronRate = 0; break;
      }
  
@@ -2093,7 +3034,7 @@ index eb0450b..dd38659 100644
      currentSpeed += (targetSpeed - currentSpeed) * 0.02;
      currentBright += (targetBright - currentBright) * 0.02;
      currentSize += (targetSize - currentSize) * 0.02;
-@@ -216,6 +242,12 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -216,6 +245,12 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
          vel[i3 + 1] += (y / dist) * bass * 0.02;
          vel[i3 + 2] += (z / dist) * bass * 0.02;
        }
@@ -2106,7 +3047,7 @@ index eb0450b..dd38659 100644
        if (state === "speaking" && mid > 0.1) {
          const pulse = Math.sin(t * 8 + px);
          vel[i3] += (x / dist) * mid * 0.012 * pulse;
-@@ -313,15 +345,27 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -313,15 +348,27 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
      mat.opacity = currentBright + bass * 0.08;
      mat.size = currentSize + bass * 0.05;
  
@@ -2116,7 +3057,7 @@ index eb0450b..dd38659 100644
 -    else { mat.color.lerp(new THREE.Color(0x4ca8e8), 0.015); lineMat.color.lerp(new THREE.Color(0x4ca8e8), 0.015); }
 +    // Colour: a slow drift around the wheel (~2 minutes per lap) so the orb is never the
 +    // same shade twice; the state only changes how saturated and bright it is.
-+    hue = (0.55 + t / 120) % 1;
++    hue = paletteHue == null ? (0.55 + t / 120) % 1 : (paletteHue + Math.sin(t * 0.25) * 0.035 + 1) % 1;
 +    const sat = state === "compacting" ? 0.3 : 0.88 + voice * 0.1;
 +    const light = state === "compacting" ? 0.4 : 0.5 + voice * 0.06;
 +    tint.setHSL(hue, sat, light);
@@ -2138,13 +3079,14 @@ index eb0450b..dd38659 100644
      renderer.render(scene, camera);
    }
  
-@@ -336,6 +380,9 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -336,6 +383,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
  
    return {
      setState(s: OrbState) { state = s; },
 +    setCenterShift(px: number) { shiftTarget = px; },
 +    setVoiceLevel(level: number) { voiceTarget = Math.max(0, Math.min(1, level)); },
 +    getHue() { return hue * 360; },
++    setPalette(h: number | null) { paletteHue = h; },
      setAnalyser(a: AnalyserNode | null) {
        analyser = a;
        if (a) freqData = new Uint8Array(a.frequencyBinCount);
@@ -2379,8 +3321,21 @@ index d301289..b2a30d3 100644
  pytest>=8.0.0
  pytest-asyncio>=0.24.0
 +edge-tts>=6.1.0
+diff --git a/run_executor.py b/run_executor.py
+index b9bc292..1d53712 100644
+--- a/run_executor.py
++++ b/run_executor.py
+@@ -441,7 +441,7 @@ class RunExecutor:
+ 
+     def _command(self, run_id: str, resume_from: str | None,
+                 model: str | None = None) -> list[str]:
+-        base = shlex.split(self._claude_path)
++        base = claude_env.resolve_cli(self._claude_path)
+         cmd = base + ["-p", "--output-format", "stream-json", "--verbose",
+                       "--session-id", run_id]
+         if resume_from:
 diff --git a/server.py b/server.py
-index 4d39b05..918b5e6 100644
+index 4d39b05..9ed1e6d 100644
 --- a/server.py
 +++ b/server.py
 @@ -61,7 +61,7 @@ from typing import Optional
@@ -2388,20 +3343,21 @@ index 4d39b05..918b5e6 100644
  import httpx
  from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 -from fastapi.responses import JSONResponse
-+from fastapi.responses import JSONResponse, StreamingResponse
++from fastapi.responses import JSONResponse, Response, StreamingResponse
  from pydantic import BaseModel
  
  import actions
-@@ -74,6 +74,8 @@ import repo_read
+@@ -74,6 +74,9 @@ import repo_read
  import run_store
  import session_steer
  import session_watch
 +import chats_view
++import transfer
 +import agents
  import specs
  import stream_parser
  import usage_scan
-@@ -95,7 +97,17 @@ log = logging.getLogger("jarvis")
+@@ -95,7 +98,17 @@ log = logging.getLogger("jarvis")
  # Config
  # ---------------------------------------------------------------------------
  
@@ -2420,7 +3376,7 @@ index 4d39b05..918b5e6 100644
  FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
  FISH_API_URL = "https://api.fish.audio/v1/tts"
  USER_NAME = os.getenv("USER_NAME", "sir")
-@@ -611,7 +623,23 @@ async def _voice_emit(msg: dict) -> None:
+@@ -611,7 +624,23 @@ async def _voice_emit(msg: dict) -> None:
  
  
  async def _synth_for_speech(text: str) -> Optional[bytes]:
@@ -2445,7 +3401,7 @@ index 4d39b05..918b5e6 100644
      if r is None:
          return None
      _session_tokens["tts_calls"] += 1
-@@ -631,7 +659,8 @@ def _fmt_reset(ts) -> str:
+@@ -631,7 +660,8 @@ def _fmt_reset(ts) -> str:
          when = datetime.fromtimestamp(float(ts))
      except (TypeError, ValueError, OSError, OverflowError):
          return "later"
@@ -2455,7 +3411,7 @@ index 4d39b05..918b5e6 100644
      days = (when.date() - datetime.now().date()).days
      if days <= 0:
          return clock
-@@ -639,7 +668,7 @@ def _fmt_reset(ts) -> str:
+@@ -639,7 +669,7 @@ def _fmt_reset(ts) -> str:
          return f"tomorrow at {clock}"
      if days < 7:
          return f"{when.strftime('%A')} at {clock}"
@@ -2464,10 +3420,72 @@ index 4d39b05..918b5e6 100644
  
  
  # True but useless: "down" names neither cause nor remedy. When the brain's
-@@ -2253,6 +2282,50 @@ async def api_list_sessions(state: str = ""):
+@@ -1849,7 +1879,19 @@ app.add_middleware(web_auth.OriginGuard)
+ 
+ @app.get("/api/health")
+ async def health():
+-    return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
++    """Server liveness plus the voice brain's state, so the UI can say WHY JARVIS is not answering."""
++    b = brain_instance
++    if b is None:
++        state, error = "off", None
++    elif b.ready:
++        state, error = "ready", None
++    elif b.failed:
++        state, error = "failed", b.last_error or "Claude Code no arrancó."
++    else:
++        state, error = "starting", b.last_error
++    return {"status": "online", "name": "JARVIS", "version": "0.1.0",
++            "brain": {"state": state, "error": (error or None) and str(error)[:400],
++                      "auth": b is not None and b.failure_reason == "auth"}}
+ 
+ 
+ @app.post("/api/tts-test")
+@@ -2253,6 +2295,93 @@ async def api_list_sessions(state: str = ""):
      return {"sessions": rows, "projects": projects, "taken_at": snap.taken_at}
  
  
++@app.post("/api/brain/restart")
++async def api_brain_restart():
++    """Try to start the voice brain again (the chat panel's REINTENTAR button)."""
++    if brain_instance is None:
++        return JSONResponse({"error": "brain not initialised"}, status_code=503)
++    asyncio.create_task(brain_instance.start())
++    return {"ok": True}
++
++
++@app.post("/api/transfer/export")
++async def api_transfer_export(request: Request):
++    """Download every Claude Code conversation + JARVIS memory (+ the chat panel history) as a .zip."""
++    try:
++        body = await request.json()
++    except ValueError:
++        body = {}
++    history = body.get("chat_history") if isinstance(body, dict) else None
++    blob, counts = await asyncio.to_thread(transfer.export_zip, history if isinstance(history, list) else None)
++    stamp = time.strftime("%Y-%m-%d")
++    return Response(content=blob, media_type="application/zip", headers={
++        "Content-Disposition": f'attachment; filename="jarvis-conversaciones-{stamp}.zip"',
++        "X-Jarvis-Counts": json.dumps(counts),
++    })
++
++
++@app.post("/api/transfer/import")
++async def api_transfer_import(request: Request):
++    """Unpack a file made by /api/transfer/export. Never overwrites what is already here."""
++    length = request.headers.get("content-length")
++    if length and length.isdigit() and int(length) > transfer.MAX_TOTAL:
++        return JSONResponse({"error": "El archivo es demasiado grande."}, status_code=413)
++    blob = await request.body()
++    if len(blob) > transfer.MAX_TOTAL:
++        return JSONResponse({"error": "El archivo es demasiado grande."}, status_code=413)
++    try:
++        result = await asyncio.to_thread(transfer.import_zip, blob)
++    except ValueError as e:
++        return JSONResponse({"error": str(e)}, status_code=400)
++    return result
++
++
 +@app.get("/api/agents")
 +async def api_agents():
 +    """Which coding agents (Claude Code, Codex) are installed and signed in on this machine."""
@@ -2498,7 +3516,9 @@ index 4d39b05..918b5e6 100644
 +@app.get("/api/chats")
 +async def api_list_chats(q: str = "", limit: int = 200):
 +    """Every Claude Code conversation on disk (not only the live ones), newest first."""
-+    rows = await asyncio.to_thread(chats_view.list_chats, q[:200], max(1, min(limit, 500)))
++    # JARVIS's own brain and its runs are Claude Code conversations too; they are not the user's chats.
++    own = (data_paths.data_dir().resolve(),)
++    rows = await asyncio.to_thread(chats_view.list_chats, q[:200], max(1, min(limit, 500)), None, own)
 +    return {"chats": rows}
 +
 +
@@ -2705,23 +3725,25 @@ index 0000000..53e7c3e
 +    err = agents.parse_event(json.dumps({"type": "turn.failed", "error": {"message": "SECRET /home/u/.codex/auth.json"}}))
 +    assert err == [{"type": "error", "text": "Codex no pudo completar la petición."}]     # raw CLI text never leaks
 diff --git a/tests/test_anchored_patterns.py b/tests/test_anchored_patterns.py
-index 2cf0972..c2b6c80 100644
+index 2cf0972..7802ee3 100644
 --- a/tests/test_anchored_patterns.py
 +++ b/tests/test_anchored_patterns.py
-@@ -260,6 +260,7 @@ def test_there_are_gates_to_check():
+@@ -260,6 +260,9 @@ def test_there_are_gates_to_check():
  # neither the search nor this table can satisfy is a gate the separator test
  # below would SKIP, and a skipped check is a check that is not being made.
  SAMPLES = {
 +    "_SID": "11111111-2222-3333-4444-555555555555",
++    "_PROJECT_ENTRY": "claude/projects/-home-u-proj/11111111-2222.jsonl",
++    "_MEMORY_ENTRY": "jarvis/memory/a-fact.md",
      "FULL_NAME_RE": "owner/name",
      "_MODEL_ID_RE": "claude-sonnet-5",
      "_URL_RE": "https://github.com/owner/name",
 diff --git a/tests/test_chats_view.py b/tests/test_chats_view.py
 new file mode 100644
-index 0000000..00f0230
+index 0000000..1f9a4a9
 --- /dev/null
 +++ b/tests/test_chats_view.py
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,94 @@
 +import json
 +import sys
 +from pathlib import Path
@@ -2805,6 +3827,17 @@ index 0000000..00f0230
 +    with p.open("a", encoding="utf-8") as fh:
 +        fh.write(json.dumps(_u("tres")) + "\n")
 +    assert chats_view.list_chats(root=tmp_path)[0]["messages"] == 3
++
++
++def test_conversations_of_jarvis_own_brain_are_excluded(tmp_path):
++    brain = tmp_path / "data" / "jarvis"
++    brain.mkdir(parents=True)
++    d = tmp_path / "p" / "-brain"
++    d.mkdir(parents=True)
++    rec = {"type": "user", "cwd": str(brain), "message": {"role": "user", "content": "(system) Warm-up"}}
++    (d / f"{SID}.jsonl").write_text(json.dumps(rec) + "\n")
++    assert chats_view.list_chats(root=tmp_path / "p")                                       # visible by default
++    assert chats_view.list_chats(root=tmp_path / "p", exclude_under=(tmp_path / "data",)) == []
 diff --git a/tests/test_header_lines.py b/tests/test_header_lines.py
 index cad6f30..dd77942 100644
 --- a/tests/test_header_lines.py
@@ -2831,6 +3864,127 @@ index cad6f30..dd77942 100644
      "server._session_line": (
          "it prints `summary()` — another session's own words — with no "
          "escaping at all, and that is correct only because every caller puts "
+diff --git a/tests/test_hush.py b/tests/test_hush.py
+index b24cc5b..8282396 100644
+--- a/tests/test_hush.py
++++ b/tests/test_hush.py
+@@ -44,8 +44,9 @@ def test_the_client_sends_a_key_press_not_a_word():
+ 
+ 
+ def test_the_button_only_exists_while_he_is_speaking():
+-    main = (Path(__file__).parent.parent / "frontend/src/main.ts").read_text()
+-    assert 'hidden = newState !== "speaking"' in main
++    # The Stop control now lives in the chat panel's header (chat.ts); the rule is the same.
++    chat = (Path(__file__).parent.parent / "frontend/src/chat.ts").read_text()
++    assert 'stopBtn.hidden = next !== "speaking"' in chat
+ 
+ 
+ def test_the_client_silences_itself_without_waiting_for_the_server():
+diff --git a/tests/test_transfer.py b/tests/test_transfer.py
+new file mode 100644
+index 0000000..9044169
+--- /dev/null
++++ b/tests/test_transfer.py
+@@ -0,0 +1,99 @@
++import io
++import json
++import sys
++import zipfile
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++
++import transfer
++
++
++def _setup(tmp_path):
++    projects = tmp_path / "a" / "projects"
++    (projects / "-home-u-proj").mkdir(parents=True)
++    (projects / "-home-u-proj" / "s1.jsonl").write_text('{"type":"user"}\n')
++    brain = tmp_path / "a" / "jarvis"
++    (brain / "memory").mkdir(parents=True)
++    (brain / "MEMORY.md").write_text("- [fact](fact.md)\n")
++    (brain / "memory" / "fact.md").write_text("a fact")
++    (brain / "tool-token").write_text("SECRET-TOKEN")
++    (brain / "connections.json").write_text('{"token": "SECRET"}')
++    return projects, brain
++
++
++def test_round_trip_moves_conversations_memory_and_chat(tmp_path):
++    projects, brain = _setup(tmp_path)
++    blob, counts = transfer.export_zip([{"role": "user", "text": "hola", "agent": "claude", "t": 1}], projects, brain)
++    assert counts["conversations"] == 1 and counts["memory_files"] == 2 and counts["chat_messages"] == 1
++    assert b"SECRET" not in blob                                     # no tokens, no connections.json
++    dst_p, dst_b = tmp_path / "b" / "projects", tmp_path / "b" / "jarvis"
++    r = transfer.import_zip(blob, dst_p, dst_b)
++    assert r["conversations"] == 1 and r["memory_files"] == 2
++    assert (dst_p / "-home-u-proj" / "s1.jsonl").read_text() == '{"type":"user"}\n'
++    assert (dst_b / "memory" / "fact.md").read_text() == "a fact"
++    assert r["chat_history"][0]["text"] == "hola"
++
++
++def test_import_never_overwrites_except_a_longer_transcript(tmp_path):
++    projects, brain = _setup(tmp_path)
++    blob, _ = transfer.export_zip(None, projects, brain)
++    dst_p, dst_b = tmp_path / "b" / "projects", tmp_path / "b" / "jarvis"
++    (dst_p / "-home-u-proj").mkdir(parents=True)
++    (dst_p / "-home-u-proj" / "s1.jsonl").write_text('{"type":"user"}\n{"more":1}\n')   # already longer here
++    (dst_b / "memory").mkdir(parents=True)
++    (dst_b / "memory" / "fact.md").write_text("my own edit")
++    r = transfer.import_zip(blob, dst_p, dst_b)
++    assert (dst_p / "-home-u-proj" / "s1.jsonl").read_text().count("\n") == 2
++    assert (dst_b / "memory" / "fact.md").read_text() == "my own edit"
++    assert r["conversations"] == 0 and r["updated"] == 0
++
++
++def _evil_zip(entries: dict) -> bytes:
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        z.writestr("manifest.json", json.dumps({"format": transfer.FORMAT}))
++        for name, data in entries.items():
++            z.writestr(name, data)
++    return buf.getvalue()
++
++
++@pytest.mark.parametrize("name", [
++    "claude/projects/../../escape.jsonl",
++    "claude/projects/x/../../../escape.jsonl",
++    "/etc/passwd",
++    "claude/projects/x/s.txt",
++    "jarvis/memory/../../../escape.md",
++    "jarvis/tool-token",
++    "jarvis/connections.json",
++    "anything/else",
++])
++def test_import_rejects_anything_outside_the_allowed_shapes(tmp_path, name):
++    dst_p, dst_b = tmp_path / "b" / "projects", tmp_path / "b" / "jarvis"
++    r = transfer.import_zip(_evil_zip({name: "x"}), dst_p, dst_b)
++    assert r["conversations"] == 0 and r["memory_files"] == 0 and r["skipped"] == 1
++    written = [p for p in tmp_path.rglob("*") if p.is_file()]
++    assert written == []
++
++
++def test_import_rejects_symlink_entries(tmp_path):
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        z.writestr("manifest.json", json.dumps({"format": transfer.FORMAT}))
++        info = zipfile.ZipInfo("claude/projects/x/s.jsonl")
++        info.external_attr = (0o120777 << 16)
++        z.writestr(info, "/etc/passwd")
++    r = transfer.import_zip(buf.getvalue(), tmp_path / "p", tmp_path / "j")
++    assert r["skipped"] == 1 and not (tmp_path / "p").exists()
++
++
++def test_import_rejects_non_jarvis_files():
++    with pytest.raises(ValueError):
++        transfer.import_zip(b"not a zip")
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        z.writestr("hello.txt", "x")
++    with pytest.raises(ValueError):
++        transfer.import_zip(buf.getvalue())
 diff --git a/tests/test_voice_fallbacks.py b/tests/test_voice_fallbacks.py
 new file mode 100644
 index 0000000..8a49583
@@ -2897,10 +4051,10 @@ index 0000000..8a49583
 +    assert asyncio.run(tts.synthesize_local("")) is None
 diff --git a/tests/test_windows_compat.py b/tests/test_windows_compat.py
 new file mode 100644
-index 0000000..8708afc
+index 0000000..148d89a
 --- /dev/null
 +++ b/tests/test_windows_compat.py
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,167 @@
 +import os
 +import sys
 +from pathlib import Path
@@ -3001,6 +4155,249 @@ index 0000000..8708afc
 +    sock_file.write_text("")                 # present, so the call gets as far as opening a socket
 +    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
 +    assert session_steer.post_to_session(str(sock_file), "hola") == session_steer.FAILED
++
++
++NPM_SHIM = r'''@ECHO off
++GOTO start
++:find_dp0
++SET dp0=%~dp0
++EXIT /b
++:start
++SETLOCAL
++CALL :find_dp0
++
++IF EXIST "%dp0%\node.exe" (
++  SET "_prog=%dp0%\node.exe"
++) ELSE (
++  SET "_prog=node"
++  SET PATHEXT=%PATHEXT:;.JS;=;%
++)
++
++endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*
++'''
++
++NATIVE_SHIM = r'''@ECHO off
++"%~dp0\node_modules\@openai\codex\bin\codex.exe" %*
++'''
++
++
++def _npm_dir(tmp_path, shim_text, target_rel):
++    npm = tmp_path / "npm"
++    target = npm.joinpath(*target_rel.split("/"))
++    target.parent.mkdir(parents=True)
++    target.write_text("")
++    (npm / "claude.cmd").write_text(shim_text)
++    return npm
++
++
++def test_windows_npm_shim_is_unwrapped_to_node_and_the_real_script(tmp_path, monkeypatch):
++    """The brain never started on Windows: shlex mangled the backslashed .CMD path, and cmd.exe
++    would have mangled the multi-line prompt. The shim must be bypassed."""
++    import claude_env
++    npm = _npm_dir(tmp_path, NPM_SHIM, "node_modules/@anthropic-ai/claude-code/cli.js")
++    monkeypatch.setattr(claude_env, "_IS_WINDOWS", True)
++    argv = claude_env.resolve_cli(str(npm / "claude.cmd"))
++    assert argv[-1] == str((npm / "node_modules/@anthropic-ai/claude-code/cli.js").resolve())
++    assert argv[0].endswith("node") or argv[0].endswith("node.exe")
++    (npm / "node.exe").write_text("")                       # a node bundled next to the shim wins
++    assert claude_env.resolve_cli(str(npm / "claude.cmd"))[0] == str(npm / "node.exe")
++
++
++def test_windows_shim_pointing_at_a_native_exe_launches_the_exe(tmp_path, monkeypatch):
++    import claude_env
++    npm = _npm_dir(tmp_path, NATIVE_SHIM, "node_modules/@openai/codex/bin/codex.exe")
++    monkeypatch.setattr(claude_env, "_IS_WINDOWS", True)
++    assert claude_env.resolve_cli(str(npm / "claude.cmd")) == [
++        str((npm / "node_modules/@openai/codex/bin/codex.exe").resolve())]
++
++
++def test_windows_backslashed_path_is_never_shlex_split(monkeypatch):
++    import claude_env
++    monkeypatch.setattr(claude_env, "_IS_WINDOWS", True)
++    path = r"C:\Program Files\Claude\claude.exe"
++    assert claude_env.resolve_cli(path) == [path]
++
++
++def test_posix_behaviour_is_unchanged():
++    import claude_env
++    assert claude_env.resolve_cli("claude") == ["claude"]
++    assert claude_env.resolve_cli("/usr/bin/env claude") == ["/usr/bin/env", "claude"]
+diff --git a/transfer.py b/transfer.py
+new file mode 100644
+index 0000000..bdb25d3
+--- /dev/null
++++ b/transfer.py
+@@ -0,0 +1,170 @@
++"""
++transfer.py — move your history from one computer to another.
++
++export_zip()  builds a .zip with
++    claude/projects/<dir>/<session>.jsonl   every Claude Code conversation on this machine
++    jarvis/MEMORY.md, jarvis/memory/**.md,
++    jarvis/journal/**.md                    JARVIS's long-term memory (plain Markdown)
++    jarvis/chat-history.json                the chat panel's history (sent by the browser)
++    manifest.json
++
++import_zip()  unpacks such a file on the other machine. It is deliberately narrow:
++  * only the three shapes above are accepted, by exact pattern — anything else in the
++    archive is skipped (no path traversal, no absolute paths, no symlinks, no other files);
++  * nothing that already exists is overwritten, except a conversation whose imported copy
++    is longer (a transcript only ever grows, so the longer one is the newer one);
++  * sizes are capped per file and in total.
++Credentials are never exported: not ~/.claude/.credentials.json, not JARVIS's tool token,
++connections.json or .env.
++"""
++from __future__ import annotations
++
++import io
++import json
++import os
++import re
++import time
++import zipfile
++from pathlib import Path
++from typing import Any, Optional
++
++import chats_view
++import data_paths
++
++FORMAT = "jarvis-transfer/1"
++MAX_FILE = 200 * 1024 * 1024
++MAX_TOTAL = 1024 * 1024 * 1024
++MAX_CHAT_HISTORY = 5 * 1024 * 1024
++
++_SAFE = r"[A-Za-z0-9._-]{1,200}"
++_PROJECT_ENTRY = re.compile(rf"claude/projects/({_SAFE})/({_SAFE}\.jsonl)")
++_MEMORY_ENTRY = re.compile(r"jarvis/((?:memory|journal)/(?:[A-Za-z0-9._ -]{1,120}/){0,4}[A-Za-z0-9._ -]{1,160}\.md|MEMORY\.md)")
++_CHAT_ENTRY = "jarvis/chat-history.json"
++
++
++def _brain_home() -> Path:
++    return data_paths.brain_home()
++
++
++def _memory_files(home: Path) -> list[Path]:
++    out: list[Path] = []
++    index = home / "MEMORY.md"
++    if index.is_file():
++        out.append(index)
++    for sub in ("memory", "journal"):
++        root = home / sub
++        if root.is_dir():
++            out += [p for p in root.rglob("*.md") if p.is_file() and not p.is_symlink()]
++    return out
++
++
++def export_zip(chat_history: Optional[list] = None, projects_root: Optional[Path] = None,
++               brain_home: Optional[Path] = None) -> tuple[bytes, dict[str, int]]:
++    projects_root = projects_root or chats_view.projects_root()
++    brain_home = brain_home or _brain_home()
++    counts = {"conversations": 0, "memory_files": 0, "chat_messages": 0, "skipped_large": 0}
++    buf = io.BytesIO()
++    total = 0
++    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
++        if projects_root.is_dir():
++            for f in sorted(projects_root.glob("*/*.jsonl")):
++                if not f.is_file() or f.is_symlink():
++                    continue
++                name = f"claude/projects/{f.parent.name}/{f.name}"
++                size = f.stat().st_size
++                if not _PROJECT_ENTRY.fullmatch(name) or size > MAX_FILE or total + size > MAX_TOTAL:
++                    counts["skipped_large"] += 1
++                    continue
++                z.write(f, name)
++                total += size
++                counts["conversations"] += 1
++        for f in _memory_files(brain_home):
++            name = "jarvis/" + f.relative_to(brain_home).as_posix()
++            if _MEMORY_ENTRY.fullmatch(name):
++                z.write(f, name)
++                counts["memory_files"] += 1
++        if isinstance(chat_history, list) and chat_history:
++            data = json.dumps(chat_history, ensure_ascii=False)
++            if len(data) <= MAX_CHAT_HISTORY:
++                z.writestr(_CHAT_ENTRY, data)
++                counts["chat_messages"] = len(chat_history)
++        z.writestr("manifest.json", json.dumps({
++            "format": FORMAT, "created": time.time(), "counts": counts,
++        }, indent=2))
++    return buf.getvalue(), counts
++
++
++def import_zip(blob: bytes, projects_root: Optional[Path] = None,
++               brain_home: Optional[Path] = None) -> dict[str, Any]:
++    projects_root = projects_root or chats_view.projects_root()
++    brain_home = brain_home or _brain_home()
++    result: dict[str, Any] = {"conversations": 0, "updated": 0, "memory_files": 0,
++                              "skipped": 0, "chat_history": []}
++    try:
++        z = zipfile.ZipFile(io.BytesIO(blob))
++    except zipfile.BadZipFile:
++        raise ValueError("El archivo no es un .zip de JARVIS válido.")
++    with z:
++        try:
++            manifest = json.loads(z.read("manifest.json"))
++        except (KeyError, ValueError):
++            raise ValueError("El archivo no es una exportación de JARVIS (falta manifest.json).")
++        if manifest.get("format") != FORMAT:
++            raise ValueError("Formato de exportación no reconocido.")
++        total = 0
++        for info in z.infolist():
++            name = info.filename
++            if info.is_dir() or name == "manifest.json":
++                continue
++            # Symlinks stored in a zip carry the S_IFLNK bit in the high bits of external_attr.
++            if (info.external_attr >> 16) & 0o170000 == 0o120000:
++                result["skipped"] += 1
++                continue
++            if info.file_size > MAX_FILE or total + info.file_size > MAX_TOTAL:
++                result["skipped"] += 1
++                continue
++            m = _PROJECT_ENTRY.fullmatch(name)
++            if m:
++                dest = projects_root / m.group(1) / m.group(2)
++                data = z.read(info)
++                total += len(data)
++                if dest.exists():
++                    if dest.stat().st_size >= len(data):
++                        continue
++                    result["updated"] += 1
++                else:
++                    result["conversations"] += 1
++                dest.parent.mkdir(parents=True, exist_ok=True)
++                _atomic_write(dest, data)
++                continue
++            m = _MEMORY_ENTRY.fullmatch(name)
++            if m:
++                rel = Path(*m.group(1).split("/"))
++                if any(part in ("..", "") for part in rel.parts):
++                    result["skipped"] += 1
++                    continue
++                dest = brain_home / rel
++                if dest.exists():
++                    continue
++                data = z.read(info)
++                total += len(data)
++                dest.parent.mkdir(parents=True, exist_ok=True)
++                _atomic_write(dest, data)
++                result["memory_files"] += 1
++                continue
++            if name == _CHAT_ENTRY and info.file_size <= MAX_CHAT_HISTORY:
++                try:
++                    items = json.loads(z.read(info))
++                    if isinstance(items, list):
++                        result["chat_history"] = items
++                except ValueError:
++                    result["skipped"] += 1
++                continue
++            result["skipped"] += 1
++    return result
++
++
++def _atomic_write(dest: Path, data: bytes) -> None:
++    tmp = dest.with_name(dest.name + ".importing")
++    tmp.write_bytes(data)
++    os.replace(tmp, dest)
 diff --git a/tts.py b/tts.py
 index 722c001..951cb26 100644
 --- a/tts.py
