@@ -10,12 +10,16 @@ PATCH="$HERE/jarvis-local-tts-fallback.patch"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Falta '$1'. $2" >&2; exit 1; }; }
 need git "Instálalo desde https://git-scm.com"
-need python3 "Necesitas Python 3.11+"
 need node "Necesitas Node.js 18+"
 need npm "Viene con Node.js"
 need claude "Ejecuta: npm install -g @anthropic-ai/claude-code   y luego 'claude' para iniciar sesión"
 
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' || { echo "Python 3.11+ requerido" >&2; exit 1; }
+# Find a real Python 3.11+ (Windows has no python3 and ships a Microsoft Store stub that is not Python).
+PY=""
+for c in python3 python py; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' >/dev/null 2>&1; then PY="$c"; break; fi
+done
+[ -n "$PY" ] || { echo "Falta Python 3.11+ (instálalo desde https://www.python.org/downloads/ marcando 'Add python.exe to PATH' y reabre la terminal)" >&2; exit 1; }
 claude auth status >/dev/null 2>&1 || { echo "Inicia sesión primero: ejecuta 'claude'" >&2; exit 1; }
 
 [ -d "$DIR/.git" ] || git clone https://github.com/ethanplusai/jarvis.git "$DIR"
@@ -29,10 +33,10 @@ command -v espeak-ng >/dev/null && command -v ffmpeg >/dev/null \
   || echo "Aviso: instala espeak-ng y ffmpeg para la voz local de respaldo (sin FISH_API_KEY)."
 
 [ -f .env ] || cp .env.example .env
-python3 -m venv .venv 2>/dev/null || true
+"$PY" -m venv .venv 2>/dev/null || true
 # shellcheck disable=SC1091
-[ -f .venv/bin/activate ] && . .venv/bin/activate
-pip install -q -r requirements.txt
+if [ -f .venv/bin/activate ]; then . .venv/bin/activate; elif [ -f .venv/Scripts/activate ]; then . .venv/Scripts/activate; fi
+python -m pip install -q -r requirements.txt
 python -m playwright install chromium >/dev/null 2>&1 || echo "Aviso: no se pudo instalar chromium de playwright (solo afecta a read_page/look_at_page)."
 (cd frontend && npm install --silent)
 
