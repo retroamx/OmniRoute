@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # One-command local setup for JARVIS (https://github.com/ethanplusai/jarvis) + Claude Code integration.
-# Usage: bash jarvis-setup.sh [target-dir]        (default: ~/jarvis)  — safe to re-run to upgrade.
+# Usage: bash jarvis-setup.sh [--no-start] [target-dir]   (default: ~/jarvis)  — safe to re-run to upgrade.
+#        --no-start: install/upgrade only, do not launch (used by start-jarvis.sh's update check).
 # Binds to 127.0.0.1 only. Never expose JARVIS on 0.0.0.0: every run it spawns has full privileges.
 set -euo pipefail
 
+NO_START=0
+if [ "${1:-}" = "--no-start" ]; then NO_START=1; shift; fi
 DIR="${1:-$HOME/jarvis}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="$HERE/jarvis-mods.patch"
@@ -55,28 +58,99 @@ python -m playwright install chromium >/dev/null 2>&1 || echo "Aviso: no se pudo
 # The dev proxy expects TLS; the server started with --host 127.0.0.1 speaks plain HTTP.
 sed -i.bak 's|https://localhost:8340|http://127.0.0.1:8340|g' frontend/vite.config.ts
 
-# Background launcher, used by the /jarvis command inside Claude Code.
-cat > start-jarvis.sh <<'LAUNCH'
-#!/usr/bin/env bash
-cd "$(dirname "$0")"
-# shellcheck disable=SC1091
-if [ -f .venv/bin/activate ]; then . .venv/bin/activate; elif [ -f .venv/Scripts/activate ]; then . .venv/Scripts/activate; fi
-mkdir -p logs
-if curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
-  echo "JARVIS ya está en marcha."
-else
-  nohup python server.py --host 127.0.0.1 > logs/server.log 2>&1 &
-  (cd frontend && nohup npm run dev > ../logs/frontend.log 2>&1 &)
-  for _ in $(seq 1 60); do curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1 && break; sleep 1; done
-  if ! curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
-    echo "ERROR: el servidor de JARVIS no arrancó. Últimas líneas de logs/server.log:" >&2
-    tail -n 40 logs/server.log >&2
-    exit 1
+# Background launcher, used by the /jarvis command inside Claude Code. On every start it looks for a
+# newer version in GitHub and ASKS before installing it (never updates silently).
+printf 'SETUP_DIR=%q\n' "$HERE" > start-jarvis.sh.new
+cat >> start-jarvis.sh.new <<'LAUNCH'
+# Usage: bash start-jarvis.sh [--update | --no-update-check]
+#   --update           install a newer version without asking (for when you already said yes)
+#   --no-update-check  skip the check entirely
+UPDATE_BASE="https://raw.githubusercontent.com/retroamx/OmniRoute/claude/jarvis-repo-setup-c4aadv/scripts/ad-hoc"
+
+check_update() {
+  local mode="$1" tmp remote_id local_id answer
+  command -v curl >/dev/null 2>&1 || return 0
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL --max-time 20 -o "$tmp/jarvis-mods.patch" "$UPDATE_BASE/jarvis-mods.patch" \
+     || ! curl -fsSL --max-time 20 -o "$tmp/jarvis-setup.sh" "$UPDATE_BASE/jarvis-setup.sh"; then
+    echo "(No se pudo comprobar si hay actualizaciones: sin conexión con GitHub. Sigo con la versión actual.)"
+    rm -rf "$tmp"; return 0
   fi
-fi
-echo "JARVIS: http://localhost:5173   (Ctrl+K = todas tus conversaciones)"
-{ start http://localhost:5173 || open http://localhost:5173 || xdg-open http://localhost:5173; } >/dev/null 2>&1 || true
+  remote_id="$(git hash-object "$tmp/jarvis-mods.patch")"
+  local_id="$(cat .jarvis-mods.id 2>/dev/null || true)"
+  if [ "$remote_id" = "$local_id" ]; then
+    echo "JARVIS está al día (versión ${local_id:0:8})."
+    rm -rf "$tmp"; return 0
+  fi
+  if ! bash -n "$tmp/jarvis-setup.sh" 2>/dev/null; then
+    echo "(Hay una versión nueva, pero su instalador está dañado. No se actualiza.)"
+    rm -rf "$tmp"; return 0
+  fi
+  echo "Hay una versión nueva de JARVIS: ${remote_id:0:8} (tienes ${local_id:0:8})."
+  if [ "$mode" != "update" ]; then
+    if [ ! -t 0 ]; then
+      echo "UPDATE_AVAILABLE: ejecuta 'bash $PWD/start-jarvis.sh --update' para instalarla."
+      rm -rf "$tmp"; return 0
+    fi
+    read -r -p "¿Actualizar ahora? (s/n) " answer || answer=n
+    case "$answer" in s|S|si|SI|sí|Sí|y|Y) ;; *) echo "Sin actualizar."; rm -rf "$tmp"; return 0 ;; esac
+  fi
+  if curl -fs --max-time 2 http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
+    echo "JARVIS está en marcha. Ciérralo (Ctrl+C en su ventana, o cierra Python/Node) y vuelve a arrancarlo para actualizar."
+    rm -rf "$tmp"; return 0
+  fi
+  echo "Actualizando..."
+  mkdir -p "$SETUP_DIR"
+  cp "$tmp/jarvis-mods.patch" "$SETUP_DIR/jarvis-mods.patch"
+  cp "$tmp/jarvis-setup.sh" "$SETUP_DIR/jarvis-setup.sh"
+  rm -rf "$tmp"
+  if bash "$SETUP_DIR/jarvis-setup.sh" --no-start "$PWD"; then
+    echo "Actualización instalada."
+  else
+    echo "La actualización falló (arriba está el motivo). Arranco con lo que hay." >&2
+  fi
+}
+
+open_browser() {
+  # Only the opener that belongs to this OS: on Linux `open` is openvt, not a browser launcher.
+  case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*) cmd.exe /c start "" "$1" >/dev/null 2>&1 < /dev/null || true ;;
+    darwin*) open "$1" >/dev/null 2>&1 < /dev/null || true ;;
+    *) command -v xdg-open >/dev/null 2>&1 && { xdg-open "$1" >/dev/null 2>&1 < /dev/null & } ;;
+  esac
+  return 0
+}
+
+main() {
+  cd "$(dirname "$0")" || exit 1
+  local mode="ask"
+  case "${1:-}" in --update) mode="update" ;; --no-update-check) mode="skip" ;; esac
+  [ "$mode" != "skip" ] && check_update "$mode"
+  # shellcheck disable=SC1091
+  if [ -f .venv/bin/activate ]; then . .venv/bin/activate; elif [ -f .venv/Scripts/activate ]; then . .venv/Scripts/activate; fi
+  mkdir -p logs
+  if curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
+    echo "JARVIS ya está en marcha."
+  else
+    # Fully detached: every fd redirected, and the frontend subshell execs into npm, so nothing
+    # keeps this terminal (or Claude Code's /jarvis) waiting after the launcher returns.
+    nohup python server.py --host 127.0.0.1 > logs/server.log 2>&1 < /dev/null &
+    ( cd frontend && exec nohup npm run dev > ../logs/frontend.log 2>&1 < /dev/null ) &
+    for _ in $(seq 1 60); do curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1 && break; sleep 1; done
+    if ! curl -fs http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
+      echo "ERROR: el servidor de JARVIS no arrancó. Últimas líneas de logs/server.log:" >&2
+      tail -n 40 logs/server.log >&2
+      return 1
+    fi
+  fi
+  echo "JARVIS: http://localhost:5173   (Ctrl+K = todas tus conversaciones)"
+  open_browser http://localhost:5173
+
+}
+# One line on purpose: the updater rewrites this file, and bash must never read past this point.
+main "$@"; exit $?
 LAUNCH
+mv -f start-jarvis.sh.new start-jarvis.sh
 chmod +x start-jarvis.sh
 
 # /jarvis slash command for Claude Code (user scope): starts JARVIS and opens its UI.
@@ -86,9 +160,16 @@ cat > "$HOME/.claude/commands/jarvis.md" <<CMD
 description: Inicia JARVIS y abre su interfaz (chat, voz y todas tus conversaciones)
 ---
 Ejecuta \`bash "$DIR/start-jarvis.sh"\` y confírmame cuando esté listo.
+Si la salida incluye UPDATE_AVAILABLE, pregúntame si quiero actualizar JARVIS. Solo si respondo que sí,
+ejecuta \`bash "$DIR/start-jarvis.sh" --update\` (si JARVIS ya estaba en marcha, dime que lo cierre antes).
 Después dime que abra http://localhost:5173 en Google Chrome: ahí puede hablar o escribir a JARVIS,
 y con Ctrl+K ve todas sus conversaciones de Claude Code, actualizadas en directo.
 CMD
+
+if [ "$NO_START" = 1 ]; then
+  echo "JARVIS instalado/actualizado (sin arrancar)."
+  exit 0
+fi
 
 echo
 echo "Arrancando el servidor de JARVIS..."
