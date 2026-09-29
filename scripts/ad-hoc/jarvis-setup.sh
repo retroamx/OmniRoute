@@ -62,10 +62,42 @@ sed -i.bak 's|https://localhost:8340|http://127.0.0.1:8340|g' frontend/vite.conf
 # newer version in GitHub and ASKS before installing it (never updates silently).
 printf 'SETUP_DIR=%q\n' "$HERE" > start-jarvis.sh.new
 cat >> start-jarvis.sh.new <<'LAUNCH'
-# Usage: bash start-jarvis.sh [--update | --no-update-check]
+# Usage: bash start-jarvis.sh [--update | --no-update-check | --stop]
 #   --update           install a newer version without asking (for when you already said yes)
 #   --no-update-check  skip the check entirely
+#   --stop             stop a running JARVIS (server + interface) and exit
 UPDATE_BASE="https://raw.githubusercontent.com/retroamx/OmniRoute/claude/jarvis-repo-setup-c4aadv/scripts/ad-hoc"
+
+# PIDs listening on a local TCP port (Windows via netstat, elsewhere lsof/fuser/ss).
+port_pids() {
+  local port="$1"
+  case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*)
+      netstat -ano 2>/dev/null | tr -d '\r' | awk -v p=":$port" '$1 == "TCP" && $4 == "LISTENING" && substr($2, length($2) - length(p) + 1) == p { print $5 }' | sort -u ;;
+    *)
+      { lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null \
+        || fuser -n tcp "$port" 2>/dev/null \
+        || ss -ltnpH "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2; } | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u ;;
+  esac
+}
+
+# Stop JARVIS: only the processes serving its two ports (and their children), never other python/node.
+stop_jarvis() {
+  local port pid stopped=0
+  for port in 8340 5173; do
+    for pid in $(port_pids "$port"); do
+      case "${OSTYPE:-}" in
+        msys*|cygwin*|win32*) taskkill //F //T //PID "$pid" >/dev/null 2>&1 && stopped=1 ;;
+        *) pkill -TERM -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null && stopped=1 ;;
+      esac
+    done
+  done
+  for _ in $(seq 1 20); do
+    [ -z "$(port_pids 8340)$(port_pids 5173)" ] && break
+    sleep 0.5
+  done
+  if [ "$stopped" = 1 ]; then echo "JARVIS detenido."; else echo "JARVIS no estaba en marcha."; fi
+}
 
 check_update() {
   local mode="$1" tmp remote_id local_id answer
@@ -96,8 +128,8 @@ check_update() {
     case "$answer" in s|S|si|SI|sí|Sí|y|Y) ;; *) echo "Sin actualizar."; rm -rf "$tmp"; return 0 ;; esac
   fi
   if curl -fs --max-time 2 http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
-    echo "JARVIS está en marcha. Ciérralo (Ctrl+C en su ventana, o cierra Python/Node) y vuelve a arrancarlo para actualizar."
-    rm -rf "$tmp"; return 0
+    echo "Cerrando JARVIS para actualizarlo..."
+    stop_jarvis
   fi
   echo "Actualizando..."
   mkdir -p "$SETUP_DIR"
@@ -124,7 +156,11 @@ open_browser() {
 main() {
   cd "$(dirname "$0")" || exit 1
   local mode="ask"
-  case "${1:-}" in --update) mode="update" ;; --no-update-check) mode="skip" ;; esac
+  case "${1:-}" in
+    --update) mode="update" ;;
+    --no-update-check) mode="skip" ;;
+    --stop) stop_jarvis; return 0 ;;
+  esac
   [ "$mode" != "skip" ] && check_update "$mode"
   # shellcheck disable=SC1091
   if [ -f .venv/bin/activate ]; then . .venv/bin/activate; elif [ -f .venv/Scripts/activate ]; then . .venv/Scripts/activate; fi
@@ -169,6 +205,11 @@ CMD
 if [ "$NO_START" = 1 ]; then
   echo "JARVIS instalado/actualizado (sin arrancar)."
   exit 0
+fi
+
+if curl -fs --max-time 2 http://127.0.0.1:8340/api/runs >/dev/null 2>&1; then
+  echo "Hay un JARVIS en marcha: lo cierro para arrancar la versión nueva."
+  bash "$DIR/start-jarvis.sh" --stop || true
 fi
 
 echo
