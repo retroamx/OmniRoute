@@ -26,12 +26,20 @@ claude auth status >/dev/null 2>&1 || { echo "Inicia sesión primero: ejecuta 'c
 cd "$DIR"
 
 # Our modifications: free neural voice (Edge TTS) + offline fallback, live "all conversations" browser,
-# typed chat panel and command-centre HUD. Re-running upgrades an older copy of the same patch.
-if [ -f "$PATCH" ] && [ ! -f chats_view.py ]; then
-  git checkout -- tts.py server.py requirements.txt frontend/src 2>/dev/null || true
-  rm -f frontend/src/chat.ts frontend/src/chat.css frontend/src/hud.ts frontend/src/hud.css \
+# typed chat panel, command-centre HUD, voice-reactive orb. A version marker decides whether the copy in
+# this folder is current; an older copy of the patch is removed first, so re-running always upgrades.
+PATCH_ID="$(git hash-object "$PATCH" 2>/dev/null || true)"
+if [ -f "$PATCH" ] && [ "$(cat .jarvis-mods.id 2>/dev/null || true)" != "$PATCH_ID" ]; then
+  echo "Aplicando la versión nueva de las mejoras de JARVIS..."
+  git checkout -- . 2>/dev/null || true
+  rm -f chats_view.py tests/test_chats_view.py tests/test_voice_fallbacks.py \
+        frontend/src/chat.ts frontend/src/chat.css frontend/src/hud.ts frontend/src/hud.css \
         frontend/src/chats.ts frontend/src/chats.css
-  git apply "$PATCH" && echo "Mejoras de JARVIS aplicadas (voz gratis, chat, conversaciones en directo)."
+  git apply "$PATCH" || { echo "No se pudo aplicar el parche. Copia lo que sale arriba y envíamelo." >&2; exit 1; }
+  echo "$PATCH_ID" > .jarvis-mods.id
+  echo "Mejoras aplicadas (versión ${PATCH_ID:0:8})."
+else
+  echo "Las mejoras de JARVIS ya están al día (versión ${PATCH_ID:0:8})."
 fi
 
 [ -f .env ] || cp .env.example .env
