@@ -1,21 +1,32 @@
+diff --git a/requirements.txt b/requirements.txt
+index d301289..b2a30d3 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -6,3 +6,4 @@ websockets>=13.0
+ playwright>=1.40.0
+ pytest>=8.0.0
+ pytest-asyncio>=0.24.0
++edge-tts>=6.1.0
 diff --git a/server.py b/server.py
-index 4d39b05..dd13f05 100644
+index 4d39b05..ce2ce7c 100644
 --- a/server.py
 +++ b/server.py
-@@ -612,6 +612,8 @@ async def _voice_emit(msg: dict) -> None:
+@@ -612,6 +612,10 @@ async def _voice_emit(msg: dict) -> None:
  
  async def _synth_for_speech(text: str) -> Optional[bytes]:
      r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
++    if r is None:
++        r = await tts.synthesize_edge(text)     # free neural voice (edge-tts, needs internet)
 +    if r is None:
 +        r = await tts.synthesize_local(text)    # offline fallback (espeak-ng + ffmpeg)
      if r is None:
          return None
      _session_tokens["tts_calls"] += 1
 diff --git a/tts.py b/tts.py
-index 722c001..3ee73b0 100644
+index 722c001..951cb26 100644
 --- a/tts.py
 +++ b/tts.py
-@@ -62,3 +62,35 @@ async def synthesize_chunk(text: str, *, api_key: str, voice_id: str,
+@@ -62,3 +62,67 @@ async def synthesize_chunk(text: str, *, api_key: str, voice_id: str,
      if not buf:
          return None
      return SynthResult(bytes(buf), first if first is not None else 0.0, time.monotonic() - t0)
@@ -51,3 +62,35 @@ index 722c001..3ee73b0 100644
 +        return None
 +    dt = time.monotonic() - t0
 +    return SynthResult(mp3, dt, dt)
++
++
++async def synthesize_edge(text: str, *, voice: str = "en-GB-RyanNeural", timeout: float = 15.0) -> Optional[SynthResult]:
++    """Free neural voice via Microsoft Edge TTS (pip install edge-tts). Needs internet, no API key."""
++    import asyncio
++    text = (text or "").strip()
++    if not text:
++        return None
++    try:
++        import edge_tts
++    except ImportError:
++        return None
++    t0 = time.monotonic()
++    first: Optional[float] = None
++    buf = bytearray()
++
++    async def _run() -> None:
++        nonlocal first
++        async for chunk in edge_tts.Communicate(text, voice).stream():
++            if chunk.get("type") == "audio":
++                if first is None:
++                    first = time.monotonic() - t0
++                buf.extend(chunk["data"])
++
++    try:
++        await asyncio.wait_for(_run(), timeout)
++    except Exception as e:      # network/API failures must fall through to the next engine
++        log.error(f"edge TTS error: {e}")
++        return None
++    if not buf:
++        return None
++    return SynthResult(bytes(buf), first if first is not None else 0.0, time.monotonic() - t0)

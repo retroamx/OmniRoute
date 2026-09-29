@@ -26,11 +26,11 @@ claude auth status >/dev/null 2>&1 || { echo "Inicia sesión primero: ejecuta 'c
 cd "$DIR"
 
 # Offline voice fallback (espeak-ng + ffmpeg) for when there is no FISH_API_KEY.
-if [ -f "$PATCH" ] && ! grep -q synthesize_local tts.py; then
-  git apply "$PATCH" && echo "Voz local de respaldo aplicada."
+# Voice chain without FISH_API_KEY: Edge TTS (free neural voice, internet) -> espeak-ng (offline).
+if [ -f "$PATCH" ] && ! grep -q synthesize_edge tts.py; then
+  git checkout -- tts.py server.py requirements.txt 2>/dev/null || true   # drop an older version of our patch
+  git apply "$PATCH" && echo "Voz gratuita (Edge TTS) y respaldo local aplicados."
 fi
-command -v espeak-ng >/dev/null && command -v ffmpeg >/dev/null \
-  || echo "Aviso: instala espeak-ng y ffmpeg para la voz local de respaldo (sin FISH_API_KEY)."
 
 [ -f .env ] || cp .env.example .env
 "$PY" -m venv .venv 2>/dev/null || true
