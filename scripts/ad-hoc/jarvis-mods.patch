@@ -1,6 +1,6 @@
 diff --git a/chats_view.py b/chats_view.py
 new file mode 100644
-index 0000000..4abe74c
+index 0000000..a363a29
 --- /dev/null
 +++ b/chats_view.py
 @@ -0,0 +1,178 @@
@@ -23,7 +23,7 @@ index 0000000..4abe74c
 +from pathlib import Path
 +from typing import Any, Optional
 +
-+_SID = re.compile(r"^[0-9A-Fa-f-]{8,64}$")
++_SID = re.compile(r"[0-9A-Fa-f-]{8,64}")
 +_META_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
 +MAX_TEXT = 6000
 +MAX_FILES = 300
@@ -145,7 +145,7 @@ index 0000000..4abe74c
 +
 +def read_chat(session_id: str, after: int = 0, limit: int = 400, root: Optional[Path] = None) -> Optional[dict[str, Any]]:
 +    """Messages of one conversation, from index ``after`` on. None if it is unknown."""
-+    if not _SID.match(session_id or ""):
++    if not _SID.fullmatch(session_id or ""):
 +        return None
 +    root = root or projects_root()
 +    matches = list(root.glob(f"*/{session_id}.jsonl")) if root.is_dir() else []
@@ -182,6 +182,18 @@ index 0000000..4abe74c
 +        "total": total,
 +        "messages": out[max(after, 0):][:limit],
 +    }
+diff --git a/frontend/index.html b/frontend/index.html
+index 9440bda..5c274c4 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -4,6 +4,7 @@
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>JARVIS</title>
++    <link rel="icon" href="data:," />
+     <link rel="stylesheet" href="/src/style.css" />
+   </head>
+   <body>
 diff --git a/frontend/src/chat.css b/frontend/src/chat.css
 new file mode 100644
 index 0000000..a183487
@@ -1106,10 +1118,10 @@ index 0000000..e0a44d3
 +}
 diff --git a/frontend/src/hud.css b/frontend/src/hud.css
 new file mode 100644
-index 0000000..e9bb096
+index 0000000..9314299
 --- /dev/null
 +++ b/frontend/src/hud.css
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,118 @@
 +/* Command-centre HUD — sits over the orb; hidden on narrow screens. */
 +
 +.hud-brand { position: fixed; top: 22px; left: 28px; z-index: 12; color: #e6f3ff; pointer-events: none; }
@@ -1185,7 +1197,7 @@ index 0000000..e9bb096
 +  .hud-left, .hud-modes, .hud-brand { display: none; }
 +}
 +
-+#error-text { top: 76px; z-index: 13; }
++body #error-text { top: 76px; z-index: 13; }
 +
 +.hud-chats {
 +  display: flex; flex-direction: column; gap: 3px; text-align: left; font: inherit; cursor: pointer; color: #e6f3ff;
@@ -1196,12 +1208,44 @@ index 0000000..e9bb096
 +.hud-chats:hover { border-color: rgba(125, 211, 252, 0.8); transform: translateY(-1px); }
 +.hud-chats-title { font-size: 13px; font-weight: 600; }
 +.hud-chats-sub { font-size: 10.5px; color: rgba(190, 220, 245, 0.55); }
++
++/* ── talk button: live state ────────────────────────────────────────────── */
++.hud-talk { display: inline-flex; align-items: center; gap: 10px; min-width: 190px; justify-content: center; transition: all 0.2s; }
++.hud-bars { display: inline-flex; align-items: center; gap: 3px; height: 24px; }
++.hud-bars i { display: block; width: 3px; height: 4px; border-radius: 3px; background: currentColor; opacity: 0.7; transition: height 0.12s ease; }
++.hud-talk[data-state="listening"] { border-color: hsla(var(--orb-h, 200), 80%, 60%, 0.5); color: hsl(var(--orb-h, 200), 85%, 78%); animation: hud-breathe 2.4s ease-in-out infinite; }
++.hud-talk[data-state="hearing"] { background: hsla(var(--orb-h, 200), 80%, 55%, 0.28); border-color: hsl(var(--orb-h, 200), 85%, 65%); color: #fff; box-shadow: 0 0 22px hsla(var(--orb-h, 200), 90%, 60%, 0.55); }
++.hud-talk[data-state="thinking"], .hud-talk[data-state="compacting"] { color: #fbbf24; border-color: rgba(251, 191, 36, 0.5); background: rgba(251, 191, 36, 0.08); }
++.hud-talk[data-state="speaking"] { color: #34d399; border-color: rgba(52, 211, 153, 0.55); background: rgba(52, 211, 153, 0.1); }
++.hud-talk[data-state="muted"] { color: rgba(248, 113, 113, 0.9); border-color: rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.07); }
++.hud-talk[data-state="thinking"] .hud-bars i, .hud-talk[data-state="speaking"] .hud-bars i { animation: hud-bar 0.9s ease-in-out infinite; }
++.hud-talk[data-state="thinking"] .hud-bars i:nth-child(2n), .hud-talk[data-state="speaking"] .hud-bars i:nth-child(2n) { animation-delay: 0.2s; }
++.hud-talk[data-state="speaking"] .hud-bars i:nth-child(3) { animation-delay: 0.4s; }
++.hud-talk[data-state="listening"] .hud-bars i { height: 6px; }
++
++.hud-lang { font: inherit; font-size: 11.5px; color: #dbeafe; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 6px 8px; outline: 0; cursor: pointer; }
++.hud-lang option { background: #0a0f18; }
++
++/* What the recogniser heard, floating under the orb. */
++.hud-heard {
++  position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%) translateY(6px); z-index: 12;
++  max-width: min(640px, 60vw); padding: 8px 16px; border-radius: 999px; font-size: 14px; text-align: center;
++  color: rgba(230, 243, 255, 0.75); background: rgba(8, 13, 22, 0.7); border: 1px solid rgba(56, 189, 248, 0.16);
++  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
++  opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s, left 0.32s cubic-bezier(0.22, 0.8, 0.24, 1);
++}
++.hud-heard.show { opacity: 1; transform: translateX(-50%); }
++.hud-heard.final { color: #fff; border-color: hsla(var(--orb-h, 200), 80%, 60%, 0.5); }
++body.chat-open .hud-heard { left: calc((100% - min(440px, 100vw) + 280px) / 2); }
++
++@keyframes hud-breathe { 50% { box-shadow: 0 0 16px hsla(var(--orb-h, 200), 90%, 60%, 0.35); } }
++@keyframes hud-bar { 0%, 100% { height: 5px; } 50% { height: 17px; } }
 diff --git a/frontend/src/hud.ts b/frontend/src/hud.ts
 new file mode 100644
-index 0000000..49d47ad
+index 0000000..5ce2861
 --- /dev/null
 +++ b/frontend/src/hud.ts
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,231 @@
 +/**
 + * Command-centre HUD around the orb: brand + clock, mode switch, live vitals
 + * (subscription windows, today's runs, recent runs) and a terminals bar that
@@ -1210,6 +1254,7 @@ index 0000000..49d47ad
 + */
 +
 +import "./hud.css";
++import { VOICE_LANGS, getVoiceLang } from "./voice";
 +
 +interface LimitWindow {
 +  key: string;
@@ -1259,7 +1304,18 @@ index 0000000..49d47ad
 +  return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
 +}
 +
-+export function createHud(opts: { onTalk(): void; onChats(): void }) {
++export type TalkState = "muted" | "idle" | "listening" | "thinking" | "speaking" | "compacting";
++
++const TALK_LABEL: Record<TalkState, string> = {
++  muted: "Micrófono apagado · pulsa para hablar",
++  idle: "Hablar",
++  listening: "Escuchando…",
++  thinking: "Pensando…",
++  speaking: "JARVIS habla…",
++  compacting: "Reorganizando memoria…",
++};
++
++export function createHud(opts: { onTalk(): void; onChats(): void; onLang(code: string): void }) {
 +  // ── top-left: brand + clock ──────────────────────────────────────────────
 +  const brand = el("div", "hud-brand");
 +  const title = el("div", "hud-title");
@@ -1312,12 +1368,37 @@ index 0000000..49d47ad
 +  const termCount = el("span", "hud-term-count", "0 abiertas");
 +  termLabel.append(termCount);
 +  const chipsWrap = el("div", "hud-term-chips");
-+  const talk = el("button", "hud-talk", "Hablar");
-+  talk.type = "button";
-+  talk.addEventListener("click", opts.onTalk);
-+  bar.append(termLabel, chipsWrap, talk);
++  const lang = el("select", "hud-lang");
++  lang.title = "Idioma en el que hablas (el reconocimiento de voz depende de él)";
++  for (const l of VOICE_LANGS) {
++    const o = el("option", "", l.label);
++    o.value = l.code;
++    lang.append(o);
++  }
++  lang.value = getVoiceLang();
++  lang.addEventListener("change", () => opts.onLang(lang.value));
 +
-+  document.body.append(brand, modes, left, bar);
++  const talk = el("button", "hud-talk");
++  talk.type = "button";
++  const bars = el("span", "hud-bars");
++  const barEls: HTMLElement[] = [];
++  for (let i = 0; i < 5; i++) {
++    const b = el("i");
++    barEls.push(b);
++    bars.append(b);
++  }
++  const talkLabel = el("span", "hud-talk-label", TALK_LABEL.idle);
++  talk.append(bars, talkLabel);
++  talk.dataset.state = "idle";
++  talk.addEventListener("click", opts.onTalk);
++  bar.append(termLabel, chipsWrap, lang, talk);
++
++  // What the recogniser is hearing right now — the quickest way to tell "it can't hear me"
++  // from "it heard me wrong".
++  const heard = el("div", "hud-heard");
++  let heardTimer = 0;
++
++  document.body.append(brand, modes, left, bar, heard);
 +
 +  // ── refresh ──────────────────────────────────────────────────────────────
 +  function tickClock() {
@@ -1375,14 +1456,37 @@ index 0000000..49d47ad
 +  refresh();
 +  setInterval(refresh, 15000);
 +
-+  return { refresh };
++  function setTalk(state: TalkState, voiceActive: boolean, level: number) {
++    const key = state === "listening" && voiceActive ? "hearing" : state;
++    talk.dataset.state = key;
++    talkLabel.textContent = key === "hearing" ? "Te oigo…" : TALK_LABEL[state];
++    const now = performance.now();
++    barEls.forEach((b, i) => {
++      const wave = 0.55 + 0.45 * Math.sin(now / 110 + i * 1.4);
++      b.style.height = (voiceActive ? 5 + level * 22 * wave : 4) + "px";
++    });
++  }
++
++  function setHeard(text: string, final: boolean) {
++    clearTimeout(heardTimer);
++    heard.textContent = text ? `“${text}”` : "";
++    heard.classList.toggle("final", final);
++    heard.classList.toggle("show", Boolean(text));
++    heardTimer = window.setTimeout(() => heard.classList.remove("show"), final ? 3500 : 6000);
++  }
++
++  return { refresh, setTalk, setHeard };
 +}
 diff --git a/frontend/src/main.ts b/frontend/src/main.ts
-index 9c26565..79b9728 100644
+index 9c26565..c2bf91e 100644
 --- a/frontend/src/main.ts
 +++ b/frontend/src/main.ts
-@@ -9,6 +9,9 @@ import { createOrb, type OrbState } from "./orb";
- import { createVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
+@@ -6,9 +6,12 @@
+  */
+ 
+ import { createOrb, type OrbState } from "./orb";
+-import { createVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
++import { createVoiceInput, createAudioPlayer, createMicMonitor, setVoiceLang } from "./voice";
  import { createSocket } from "./ws";
  import { openSettings, checkFirstTimeSetup } from "./settings";
 +import { createChat } from "./chat";
@@ -1391,23 +1495,93 @@ index 9c26565..79b9728 100644
  import "./style.css";
  
  // ---------------------------------------------------------------------------
-@@ -63,6 +66,7 @@ function transition(newState: State) {
+@@ -33,8 +36,8 @@ function showError(msg: string) {
+ function updateStatus(state: State) {
+   const labels: Record<State, string> = {
+     idle: "",
+-    listening: "listening...",
+-    thinking: "thinking...",
++    listening: "",           // the talk button carries these now
++    thinking: "",
+     speaking: "",
+     compacting: "",          // the notice banner carries the words; the orb carries the state
+   };
+@@ -63,6 +66,8 @@ function transition(newState: State) {
    const btn = document.getElementById("hush");
    if (btn) (btn as HTMLButtonElement).hidden = newState !== "speaking";
    orb.setState(newState as OrbState);
 +  chat.setState(newState);
++  hud.setTalk(talkState(), voiceActive, 0);
    updateStatus(newState);
  
    if (isMuted) return;
-@@ -81,6 +85,7 @@ const voiceInput = createVoiceInput(
+@@ -81,10 +86,13 @@ const voiceInput = createVoiceInput(
    (text: string) => {
      // The server decides whether this is echo, a barge-in, or a new turn.
      micMonitor.sawSpeech();
 +    chat.addUser(text, true);
++    hud.setHeard(text, true);
      socket.send({ type: "transcript", text, isFinal: true });
    },
    (text: string) => {
-@@ -142,6 +147,26 @@ function hush() {
+     micMonitor.sawSpeech();
++    hud.setHeard(text, false);
+     socket.send({ type: "interim", text });
+   },
+   (msg: string) => {
+@@ -111,6 +119,7 @@ const micMonitor = createMicMonitor(
+     const pct = Math.min(100, Math.round(level * 900));
+     micDot.style.setProperty("--level", `${pct}%`);
+     micDot.classList.toggle("is-hot", level > 0.02);
++    onMicLevel(level);
+   },
+   (event: string) => {
+     socket.send({ type: "mic", text: event });
+@@ -121,6 +130,43 @@ const micMonitor = createMicMonitor(
+   }
+ );
+ 
++// ── the user's own voice: drives the orb and the talk button ─────────────────
++// Normalised against a noise floor, with hysteresis so the "hearing you" state neither
++// flickers on breaths nor lingers after you stop. While JARVIS is talking (or the mic is
++// muted) the level is forced to zero: his own voice comes back through the microphone.
++let voiceActive = false;
++let voiceOnAt = 0;
++let lastLoudAt = 0;
++let lastSoundAt = Date.now();
++let noSoundWarnedAt = 0;
++const micStartedAt = Date.now();
++
++function talkState(): "muted" | State {
++  return isMuted ? "muted" : currentState;
++}
++
++function onMicLevel(rms: number) {
++  const now = Date.now();
++  const heardSound = rms > 0.006;
++  if (heardSound) lastSoundAt = now;
++  const blocked = isMuted || currentState === "speaking" || currentState === "thinking";
++  const norm = blocked ? 0 : Math.max(0, Math.min(1, (rms - 0.012) / 0.09));
++  if (norm > 0.12) {
++    lastLoudAt = now;
++    if (!voiceActive) { voiceActive = true; voiceOnAt = now; }
++  } else if (voiceActive && now - lastLoudAt > 600) {
++    voiceActive = false;
++  }
++  orb.setVoiceLevel(voiceActive ? Math.max(norm, 0.2) : 0);
++  hud.setTalk(talkState(), voiceActive, norm);
++
++  // Nothing at all reaching the browser: say so instead of leaving the user guessing.
++  if (!isMuted && now - micStartedAt > 10000 && now - lastSoundAt > 10000 && now - noSoundWarnedAt > 60000) {
++    noSoundWarnedAt = now;
++    showError("No detecto sonido del micrófono. Comprueba el dispositivo de entrada de Windows y el permiso de Chrome.");
++  }
++}
++
+ // ── stopping him ──────────────────────────────────────────────────────────
+ // Escape, or the button that appears while he is talking. Not a spoken word:
+ // his voice comes back through the microphone garbled, and a mis-hear that
+@@ -142,6 +188,34 @@ function hush() {
    transition(isMuted ? "idle" : "listening");
  }
  
@@ -1419,7 +1593,15 @@ index 9c26565..79b9728 100644
 +
 +// Command-centre HUD: brand/clock, live vitals, terminals bar.
 +const chats = createChats({ onAskJarvis: (text: string) => chat.ask(text) });
-+createHud({ onTalk: () => document.getElementById("btn-mute")?.click(), onChats: () => chats.open() });
++const hud = createHud({
++  onTalk: () => document.getElementById("btn-mute")?.click(),
++  onChats: () => chats.open(),
++  onLang: (code: string) => {
++    setVoiceLang(code);
++    voiceInput.restart("language changed");
++    showError(`Idioma de voz: ${code}`);
++  },
++});
 +
 +// Keep the orb centred in the space left between the side panels.
 +function layoutOrb() {
@@ -1434,7 +1616,7 @@ index 9c26565..79b9728 100644
  hushBtn.addEventListener("click", hush);
  window.addEventListener("keydown", (e: KeyboardEvent) => {
    if (e.key === "Escape") { e.preventDefault(); hush(); }
-@@ -165,6 +190,7 @@ audioPlayer.onNeedsGesture(() => {
+@@ -165,6 +239,7 @@ audioPlayer.onNeedsGesture(() => {
  
  socket.onMessage((msg) => {
    const type = msg.type as string;
@@ -1442,26 +1624,114 @@ index 9c26565..79b9728 100644
  
    if (type === "config") {
      muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
+@@ -238,6 +313,8 @@ btnMute.addEventListener("click", (e) => {
+   e.stopPropagation();
+   isMuted = !isMuted;
+   btnMute.classList.toggle("muted", isMuted);
++  if (isMuted) { voiceActive = false; orb.setVoiceLevel(0); }
++  hud.setTalk(talkState(), false, 0);
+   if (isMuted) {
+     voiceInput.pause();
+     transition("idle");
 diff --git a/frontend/src/orb.ts b/frontend/src/orb.ts
-index eb0450b..616ca06 100644
+index eb0450b..dd38659 100644
 --- a/frontend/src/orb.ts
 +++ b/frontend/src/orb.ts
-@@ -19,10 +19,14 @@ export interface Orb {
+@@ -19,10 +19,22 @@ export interface Orb {
    setState(s: OrbState): void;
    setAnalyser(a: AnalyserNode | null): void;
    destroy(): void;
 +  /** Shift the orb's centre horizontally by px (positive = right), eased. */
 +  setCenterShift(px: number): void;
++  /** The user's own voice level, 0..1. The orb stirs while it is > 0 and settles when it drops. */
++  setVoiceLevel(level: number): void;
++  /** Current hue in degrees (0..360), so the UI can borrow the orb's colour. */
++  getHue(): number;
  }
  
  export function createOrb(canvas: HTMLCanvasElement): Orb {
    let destroyed = false;
 +  let shiftTarget = 0;
 +  let shiftNow = 0;
++  let voiceTarget = 0;   // raw input, 0..1
++  let voice = 0;         // smoothed: fast attack, slower release, so it stops when you stop
++  let hue = 0.55;
++  const tint = new THREE.Color();
    const N = 2000;
  
    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-@@ -322,6 +326,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -122,6 +134,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+   let freqData = new Uint8Array(64);
+   let bass = 0, mid = 0;
+ 
++  let lastHueEmit = 0;
+   const clock = new THREE.Clock();
+ 
+   function animate() {
+@@ -129,6 +142,10 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+     requestAnimationFrame(animate);
+     const t = clock.getElapsedTime();
+ 
++    // The user's voice: rises quickly, falls away within about half a second.
++    voice += (voiceTarget - voice) * (voiceTarget > voice ? 0.35 : 0.12);
++    if (voice < 0.01 && voiceTarget === 0) voice = 0;
++
+     switch (state) {
+       case "idle":
+         targetRadius = 28; targetSpeed = 0.2; targetBright = 0.5; targetSize = 0.35;
+@@ -149,7 +166,16 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+         targetLineAmount = 0.0; targetElectronRate = 0; break;
+     }
+ 
+-    currentRadius += (targetRadius - currentRadius) * 0.02;
++    if (voice > 0) {
++      // Speaking to it: swell, brighten, connect and stir.
++      targetRadius += voice * 5;
++      targetBright += voice * 0.3;
++      targetSize += voice * 0.18;
++      targetLineAmount = Math.min(1, targetLineAmount + voice * 0.6);
++      targetSpeed += voice * 1.4;
++    }
++
++    currentRadius += (targetRadius - currentRadius) * (voice > 0 ? 0.08 : 0.02);
+     currentSpeed += (targetSpeed - currentSpeed) * 0.02;
+     currentBright += (targetBright - currentBright) * 0.02;
+     currentSize += (targetSize - currentSize) * 0.02;
+@@ -216,6 +242,12 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+         vel[i3 + 1] += (y / dist) * bass * 0.02;
+         vel[i3 + 2] += (z / dist) * bass * 0.02;
+       }
++      if (voice > 0.02) {
++        const stir = Math.sin(t * 9 + px);
++        vel[i3] += (x / dist) * voice * 0.03 * stir;
++        vel[i3 + 1] += (y / dist) * voice * 0.03 * Math.cos(t * 7 + px);
++        vel[i3 + 2] += (z / dist) * voice * 0.02 * stir;
++      }
+       if (state === "speaking" && mid > 0.1) {
+         const pulse = Math.sin(t * 8 + px);
+         vel[i3] += (x / dist) * mid * 0.012 * pulse;
+@@ -313,15 +345,27 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+     mat.opacity = currentBright + bass * 0.08;
+     mat.size = currentSize + bass * 0.05;
+ 
+-    if (state === "thinking") { mat.color.lerp(new THREE.Color(0x6ec4ff), 0.015); lineMat.color.lerp(new THREE.Color(0x6ec4ff), 0.015); }
+-    else if (state === "speaking") { mat.color.lerp(new THREE.Color(0x5ab8f0), 0.015); lineMat.color.lerp(new THREE.Color(0x5ab8f0), 0.015); }
+-    else if (state === "compacting") { mat.color.lerp(new THREE.Color(0x3a5f8a), 0.03); lineMat.color.lerp(new THREE.Color(0x3a5f8a), 0.03); }   // desaturated, cooler
+-    else { mat.color.lerp(new THREE.Color(0x4ca8e8), 0.015); lineMat.color.lerp(new THREE.Color(0x4ca8e8), 0.015); }
++    // Colour: a slow drift around the wheel (~2 minutes per lap) so the orb is never the
++    // same shade twice; the state only changes how saturated and bright it is.
++    hue = (0.55 + t / 120) % 1;
++    const sat = state === "compacting" ? 0.3 : 0.88 + voice * 0.1;
++    const light = state === "compacting" ? 0.4 : 0.5 + voice * 0.06;
++    tint.setHSL(hue, sat, light);
++    mat.color.lerp(tint, 0.05);
++    lineMat.color.lerp(tint, 0.05);
++    if (t - lastHueEmit > 0.5) {
++      lastHueEmit = t;
++      document.documentElement.style.setProperty("--orb-h", String(Math.round(hue * 360)));
++    }
+ 
+     camera.position.x = Math.sin(t * 0.02) * 5;
      camera.position.y = Math.cos(t * 0.03) * 3;
      camera.lookAt(0, 0, cloudZ * 0.2);
  
@@ -1472,14 +1742,96 @@ index eb0450b..616ca06 100644
      renderer.render(scene, camera);
    }
  
-@@ -336,6 +344,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
+@@ -336,6 +380,9 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
  
    return {
      setState(s: OrbState) { state = s; },
 +    setCenterShift(px: number) { shiftTarget = px; },
++    setVoiceLevel(level: number) { voiceTarget = Math.max(0, Math.min(1, level)); },
++    getHue() { return hue * 360; },
      setAnalyser(a: AnalyserNode | null) {
        analyser = a;
        if (a) freqData = new Uint8Array(a.frequencyBinCount);
+diff --git a/frontend/src/settings.ts b/frontend/src/settings.ts
+index a6742f0..b541921 100644
+--- a/frontend/src/settings.ts
++++ b/frontend/src/settings.ts
+@@ -388,7 +388,13 @@ export function isSettingsOpen(): boolean {
+ export async function checkFirstTimeSetup(): Promise<boolean> {
+   try {
+     const status = await apiGet<StatusResponse>("/api/settings/status");
+-    if (!status.env_keys_set.fish_audio) {
++    // Shown once per browser. It used to reopen on every load until a Fish key was set, and its
++    // invisible backdrop swallowed clicks on everything behind it; JARVIS now speaks without a key
++    // (Edge TTS / local voice), so the wizard is an offer, not a gate. Menu -> Settings still opens it.
++    let seen = false;
++    try { seen = localStorage.getItem("jarvis.setup.seen") === "1"; } catch { /* storage blocked */ }
++    if (!status.env_keys_set.fish_audio && !seen) {
++      try { localStorage.setItem("jarvis.setup.seen", "1"); } catch { /* ignore */ }
+       openSettings();
+       return true;
+     }
+diff --git a/frontend/src/voice.ts b/frontend/src/voice.ts
+index b564ab3..ddccd95 100644
+--- a/frontend/src/voice.ts
++++ b/frontend/src/voice.ts
+@@ -93,6 +93,33 @@ declare const webkitSpeechRecognition: any;
+  * live and the recogniser is the problem — which is exactly the case that
+  * used to be invisible.
+  */
++// The recogniser used to be pinned to en-US, so anything said in Spanish was
++// misheard or dropped. The language is now the user's choice, remembered, and
++// defaults to the browser's own language when Chrome supports it.
++export const VOICE_LANGS: { code: string; label: string }[] = [
++  { code: "es-ES", label: "Español (España)" },
++  { code: "es-MX", label: "Español (México)" },
++  { code: "es-US", label: "Español (EE. UU.)" },
++  { code: "en-US", label: "English (US)" },
++  { code: "en-GB", label: "English (UK)" },
++];
++
++export function getVoiceLang(): string {
++  try {
++    const saved = localStorage.getItem("jarvis.voice.lang");
++    if (saved && VOICE_LANGS.some((l) => l.code === saved)) return saved;
++  } catch { /* storage blocked: fall through */ }
++  const nav = (navigator.language || "en-US").toLowerCase();
++  const exact = VOICE_LANGS.find((l) => l.code.toLowerCase() === nav);
++  if (exact) return exact.code;
++  if (nav.startsWith("es")) return "es-ES";
++  return "en-US";
++}
++
++export function setVoiceLang(code: string): void {
++  try { localStorage.setItem("jarvis.voice.lang", code); } catch { /* ignore */ }
++}
++
+ export function createMicMonitor(
+   onLevel: (level: number) => void,
+   onEvent: (event: string) => void
+@@ -229,7 +256,7 @@ export function createVoiceInput(
+     const sr = new SR();
+     sr.continuous = true;
+     sr.interimResults = true;
+-    sr.lang = "en-US";
++    sr.lang = getVoiceLang();
+     const e: Engine = { sr, running: false, audio: false, startedAt: 0, stoppedAt: 0, retired: false };
+ 
+     sr.onstart = () => {
+diff --git a/preflight.py b/preflight.py
+index 01adb00..1557db5 100644
+--- a/preflight.py
++++ b/preflight.py
+@@ -441,7 +441,8 @@ def _check_screen_recording_sync() -> Check:
+ 
+ def _check_fish_api_key_sync() -> Check:
+     """FISH_API_KEY must be set or JARVIS has no voice."""
+-    if os.environ.get("FISH_API_KEY"):
++    key = os.environ.get("FISH_API_KEY", "").strip()
++    if key and not key.lower().startswith("your-"):     # the .env template's placeholder is not a key
+         return Check(name="fish_api_key", status=STATUS_OK, message="FISH_API_KEY is set.")
+     return Check(
+         name="fish_api_key",
 diff --git a/requirements.txt b/requirements.txt
 index d301289..b2a30d3 100644
 --- a/requirements.txt
@@ -1490,7 +1842,7 @@ index d301289..b2a30d3 100644
  pytest-asyncio>=0.24.0
 +edge-tts>=6.1.0
 diff --git a/server.py b/server.py
-index 4d39b05..9c2c3b9 100644
+index 4d39b05..f27eeed 100644
 --- a/server.py
 +++ b/server.py
 @@ -74,6 +74,7 @@ import repo_read
@@ -1501,10 +1853,43 @@ index 4d39b05..9c2c3b9 100644
  import specs
  import stream_parser
  import usage_scan
-@@ -612,6 +613,10 @@ async def _voice_emit(msg: dict) -> None:
+@@ -95,7 +96,17 @@ log = logging.getLogger("jarvis")
+ # Config
+ # ---------------------------------------------------------------------------
+ 
+-FISH_API_KEY = os.getenv("FISH_API_KEY", "")
++def _real_key(value: str) -> str:
++    """The .env template ships a placeholder ("your-...-here"); it is not a key.
++    Treating it as one made every sentence go to Fish Audio, fail with a 403 and only
++    then fall back."""
++    v = (value or "").strip()
++    return "" if not v or v.lower().startswith("your-") else v
++
++
++FISH_API_KEY = _real_key(os.getenv("FISH_API_KEY", ""))
++_fish_fail_streak = 0
++_fish_skip_until = 0.0
+ FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
+ FISH_API_URL = "https://api.fish.audio/v1/tts"
+ USER_NAME = os.getenv("USER_NAME", "sir")
+@@ -611,7 +622,23 @@ async def _voice_emit(msg: dict) -> None:
+ 
  
  async def _synth_for_speech(text: str) -> Optional[bytes]:
-     r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
+-    r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
++    global _fish_fail_streak, _fish_skip_until
++    r = None
++    if FISH_API_KEY and time.monotonic() >= _fish_skip_until:
++        r = await tts.synthesize_chunk(text, api_key=FISH_API_KEY, voice_id=FISH_VOICE_ID, client=_tts_client)
++        if r is None:
++            _fish_fail_streak += 1
++            if _fish_fail_streak >= 3:
++                # A bad key or a blocked network fails every time; stop paying the round trip per sentence.
++                _fish_skip_until = time.monotonic() + 300
++                _fish_fail_streak = 0
++                log.warning("Fish Audio failed 3 times in a row; using the fallback voice for 5 minutes")
++        else:
++            _fish_fail_streak = 0
 +    if r is None:
 +        r = await tts.synthesize_edge(text)     # free neural voice (edge-tts, needs internet)
 +    if r is None:
@@ -1512,7 +1897,7 @@ index 4d39b05..9c2c3b9 100644
      if r is None:
          return None
      _session_tokens["tts_calls"] += 1
-@@ -2253,6 +2258,23 @@ async def api_list_sessions(state: str = ""):
+@@ -2253,6 +2280,23 @@ async def api_list_sessions(state: str = ""):
      return {"sessions": rows, "projects": projects, "taken_at": snap.taken_at}
  
  
@@ -1536,12 +1921,24 @@ index 4d39b05..9c2c3b9 100644
  # The tool result cap is what keeps the brain's context under budget.
  TOOL_RESULT_CAP = 1500
  
+diff --git a/tests/test_anchored_patterns.py b/tests/test_anchored_patterns.py
+index 2cf0972..c2b6c80 100644
+--- a/tests/test_anchored_patterns.py
++++ b/tests/test_anchored_patterns.py
+@@ -260,6 +260,7 @@ def test_there_are_gates_to_check():
+ # neither the search nor this table can satisfy is a gate the separator test
+ # below would SKIP, and a skipped check is a check that is not being made.
+ SAMPLES = {
++    "_SID": "11111111-2222-3333-4444-555555555555",
+     "FULL_NAME_RE": "owner/name",
+     "_MODEL_ID_RE": "claude-sonnet-5",
+     "_URL_RE": "https://github.com/owner/name",
 diff --git a/tests/test_chats_view.py b/tests/test_chats_view.py
 new file mode 100644
-index 0000000..a729464
+index 0000000..00f0230
 --- /dev/null
 +++ b/tests/test_chats_view.py
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,83 @@
 +import json
 +import sys
 +from pathlib import Path
@@ -1616,6 +2013,7 @@ index 0000000..a729464
 +    _write(tmp_path, SID, [_u("x"), _a([{"type": "text", "text": "y"}])])
 +    assert chats_view.read_chat("../../etc/passwd", root=tmp_path) is None
 +    assert chats_view.read_chat("aaaaaaaa-bbbb", root=tmp_path) is None
++    assert chats_view.read_chat(SID + "\n", root=tmp_path) is None   # a trailing newline must not pass
 +
 +
 +def test_summary_cache_refreshes_when_file_grows(tmp_path):
@@ -1624,6 +2022,91 @@ index 0000000..a729464
 +    with p.open("a", encoding="utf-8") as fh:
 +        fh.write(json.dumps(_u("tres")) + "\n")
 +    assert chats_view.list_chats(root=tmp_path)[0]["messages"] == 3
+diff --git a/tests/test_header_lines.py b/tests/test_header_lines.py
+index cad6f30..2d16c30 100644
+--- a/tests/test_header_lines.py
++++ b/tests/test_header_lines.py
+@@ -384,6 +384,16 @@ PRINTERS = _functions_that_print_a_foreign_field()
+ # to-do: every one of them is a place where a session's own words DO reach a
+ # string, and the argument is why that string is safe.
+ EXEMPT = {
++    "chats_view.list_chats": (
++        "it returns conversation titles read from the user's own transcript files, but only "
++        "as JSON for the browser's Conversations panel (GET /api/chats). Nothing here builds "
++        "a string for the brain, a tool result or speech, and the panel renders it with "
++        "textContent / createElement, never innerHTML"),
++    "chats_view.read_chat": (
++        "the same argument as `list_chats`: message text goes to the Conversations panel as "
++        "JSON and is drawn with DOM text nodes. It is never an MCP tool result. Asking "
++        "JARVIS to summarise a chat is a deliberate user click that hands over an excerpt "
++        "labelled as content to summarise, not as instructions"),
+     "server._session_line": (
+         "it prints `summary()` — another session's own words — with no "
+         "escaping at all, and that is correct only because every caller puts "
+diff --git a/tests/test_voice_fallbacks.py b/tests/test_voice_fallbacks.py
+new file mode 100644
+index 0000000..8a49583
+--- /dev/null
++++ b/tests/test_voice_fallbacks.py
+@@ -0,0 +1,58 @@
++import asyncio
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++
++import preflight
++import tts
++
++
++def test_placeholder_key_from_env_template_is_not_a_key(monkeypatch):
++    import server
++    assert server._real_key("your-fish-audio-api-key-here") == ""
++    assert server._real_key("  ") == ""
++    assert server._real_key("") == ""
++    assert server._real_key(" abc123 ") == "abc123"
++
++
++def test_preflight_does_not_accept_the_template_placeholder(monkeypatch):
++    monkeypatch.setenv("FISH_API_KEY", "your-fish-audio-api-key-here")
++    assert preflight._check_fish_api_key_sync().status == preflight.STATUS_FAIL
++    monkeypatch.setenv("FISH_API_KEY", "real-key-value")
++    assert preflight._check_fish_api_key_sync().status == preflight.STATUS_OK
++
++
++def test_edge_voice_returns_none_instead_of_raising_when_offline(monkeypatch):
++    class Boom:
++        class Communicate:
++            def __init__(self, *a, **k):
++                pass
++
++            async def stream(self):
++                raise OSError("network is down")
++                yield  # pragma: no cover
++
++    monkeypatch.setitem(sys.modules, "edge_tts", Boom)
++    assert asyncio.run(tts.synthesize_edge("hello")) is None
++
++
++def test_edge_voice_assembles_audio_chunks(monkeypatch):
++    class Fake:
++        class Communicate:
++            def __init__(self, text, voice):
++                self.voice = voice
++
++            async def stream(self):
++                yield {"type": "WordBoundary", "offset": 0}
++                yield {"type": "audio", "data": b"ID3"}
++                yield {"type": "audio", "data": b"\x00\x01"}
++
++    monkeypatch.setitem(sys.modules, "edge_tts", Fake)
++    r = asyncio.run(tts.synthesize_edge("hola"))
++    assert r is not None and r.audio == b"ID3\x00\x01"
++
++
++def test_empty_text_is_never_synthesised():
++    assert asyncio.run(tts.synthesize_edge("   ")) is None
++    assert asyncio.run(tts.synthesize_local("")) is None
 diff --git a/tts.py b/tts.py
 index 722c001..951cb26 100644
 --- a/tts.py
